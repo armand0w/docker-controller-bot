@@ -105,7 +105,7 @@ Casi todos funcionan de dos formas: escribe el comando solo (`/run`) y el bot te
 | `/mute <minutos>` | Silencia las notificaciones durante X minutos |
 | `/schedule` | Crea, edita y borra tareas programadas |
 | `/settings` | Ajustes del bot y hosts de Docker |
-| `/version` `/donate` `/donors` | Versión / donar / donantes |
+| `/version` | Versión |
 
 ---
 
@@ -206,5 +206,3 @@ Si aun así prefieres no enviarlas, se desactivan desde `/settings` → *Estadí
 ## 🙏 Agradecimientos
 
 Traducciones de [ManCaveMedia](https://github.com/ManCaveMedia) (neerlandés), [shedowe19](https://github.com/shedowe19) (alemán), [leyalton](https://github.com/leyalton) (ruso), [monfero](https://github.com/monfero) (gallego), [zichichi](https://github.com/zichichi) (italiano) y [flancky](https://t.me/flancky) (catalán). Pruebas del Docker Login de [garanda](https://github.com/garanda21) y README en inglés de [phampyk](https://github.com/phampyk).
-
-Si el bot te resulta útil, puedes invitarme a un café con `/donate` ☕
