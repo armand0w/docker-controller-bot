@@ -47,7 +47,7 @@ DEFAULTS = {
 		"check_update_every_hours": 4.0,
 		"check_update_stopped_containers": True,
 		# Anonymous usage statistics, sent once a day. See telemetry.py.
-		"telemetry": True,
+		"telemetry": False,
 	},
 	# Docker hosts the bot manages. Each entry is
 	# {"id": "h_xxxx", "alias": "casa", "url": "unix:///var/run/docker.sock"}.

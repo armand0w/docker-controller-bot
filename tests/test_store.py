@@ -74,7 +74,7 @@ def test_a_hand_edited_value_is_read_as_the_type_it_should_be():
 	"""`"telemetry": "false"` is a non-empty string, and every caller tests for truth."""
 	root = fresh_root()
 	for raw, expected in (("false", False), ("0", False), ("no", False), ("", False), ("falso", False),
-							("true", True), ("1", True), (" Yes ", True), (0, False), (1, True), (None, True)):
+							("true", True), ("1", True), (" Yes ", True), (0, False), (1, True), (None, False)):
 		store.set("bot.telemetry", raw)
 		assert store.get("bot.telemetry") is expected, (raw, store.get("bot.telemetry"))
 	store.set("bot.button_columns", "3")

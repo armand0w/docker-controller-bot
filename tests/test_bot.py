@@ -5770,7 +5770,7 @@ def test_a_ping_answered_with_something_other_than_an_object_counts_as_sent():
 
 
 def test_telemetry_needs_a_volume_and_the_setting():
-	assert SEEDED["telemetry"] is True, "activadas por defecto"
+	assert SEEDED["telemetry"] is False, "desactivadas por defecto"
 	with _telemetry_state(persistent=True, on=True):
 		assert dcb.telemetry_on()
 		store.set("bot.telemetry", False)
