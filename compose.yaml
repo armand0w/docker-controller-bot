@@ -1,0 +1,53 @@
+services:
+    controller-bot:
+        build:
+          context: .
+          dockerfile_inline: |
+            FROM alpine:3.24.2
+
+            ENV TZ=America/Mexico_City \
+                PYTHONUNBUFFERED=1
+
+            WORKDIR /app
+
+            RUN apk add --no-cache python3 py3-pip tzdata py3-paramiko openssh-client && \
+                mkdir -p /etc/ssh/ssh_config.d && \
+                printf 'Host *\n    BatchMode yes\n    ConnectTimeout 10\n    ServerAliveInterval 10\n    ServerAliveCountMax 3\n' \
+                    > /etc/ssh/ssh_config.d/docker-controller-bot.conf
+
+            COPY requirements.txt /app/
+
+            RUN export PIP_BREAK_SYSTEM_PACKAGES=1 && \
+                pip3 install --no-cache-dir -Ur /app/requirements.txt
+
+            COPY *.py /app/
+            COPY locale /app/locale
+
+            HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+                CMD python3 -c "import sys; sys.exit(0)" || exit 1
+
+            ENTRYPOINT ["python3", "docker-controller-bot.py"]
+        pull_policy: build
+        environment:
+            - CONTAINER_NAME=${CONTAINER_NAME:-controller-bot}
+            - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+            - TELEGRAM_ADMIN=${TELEGRAM_ADMIN}
+            - TELEMETRY=false
+            #- TELEGRAM_GROUP=
+            #- TELEGRAM_THREAD=1
+            #- TELEGRAM_NOTIFICATION_CHANNEL=
+            #- CHECK_UPDATES=1
+            #- CHECK_UPDATE_EVERY_HOURS=4
+            - CHECK_UPDATE_STOPPED_CONTAINERS=0
+            #- BUTTON_COLUMNS=2
+            #- LANGUAGE=ES
+            #- EXTENDED_MESSAGES=0
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock
+            - ./config:/app/config
+        image: controller-bot:local
+        container_name: ${CONTAINER_NAME:-controller-bot}
+        hostname: ${HOST_NAME:-controller-bot}
+        restart: always
+        network_mode: host
+        tty: true
