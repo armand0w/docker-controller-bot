@@ -1,0 +1,1191 @@
+"""
+The Docker hosts the bot manages.
+
+Hosts are defined in the settings file, not in the environment, so one can be
+added from Telegram without touching the compose. Each entry looks like:
+
+	{"id": "h_a91c", "alias": "nas", "url": "ssh://dgongut@nas", "local": false}
+
+The id is generated once and never changes. Everything host-specific is keyed
+on it rather than on the alias, so renaming a host — or moving it from tcp:// to
+ssh:// once it has TLS — does not orphan its cached update state or its
+schedules.
+
+Credentials never live in the settings file. An ssh key or a TLS certificate is
+mapped into the container as a file and the settings only name the path, which
+keeps a chat message from ever carrying key material.
+"""
+
+import io
+import os
+import select
+import shutil
+import socket
+import threading
+import time
+
+import store
+from logger import debug, warning
+
+LOCAL_SOCKET_URL = "unix:///var/run/docker.sock"
+
+# The three transports the Docker SDK speaks. Anything else parses fine as a
+# URL and then fails much later, with an error that says nothing about what was
+# actually wrong.
+SUPPORTED_SCHEMES = ("unix://", "tcp://", "ssh://")
+
+# What a host's operations wait for when it does not say otherwise. The SDK
+# applies this to every request, not just to opening the connection —it is how
+# long a response may go quiet before the request gives up— so it has to be
+# long enough for the slowest legitimate answer rather than for the quickest.
+#
+# It does not bound an /exec, whatever its value. exec_run reads the command's
+# output with docker.utils.socket.read, which polls the connection with no
+# deadline at all, so a command that never ends holds its thread for good; the
+# bot puts its own limit on an exec instead of counting on this one.
+DEFAULT_TIMEOUT_SECONDS = 30
+
+# What a reachability check waits for. Far shorter, because the only question it
+# asks is whether the daemon is there: nothing it does can legitimately take
+# thirty seconds, so waiting that long only delays finding out the host is down.
+PROBE_TIMEOUT_SECONDS = 5
+
+# What a prune waits for. Far longer, because the daemon cancels a prune the
+# moment the client hangs up: on a slow disk with gigabytes of old images the
+# working timeout cut every attempt short, nothing was ever freed and the next
+# one had just as much to do.
+SLOW_TIMEOUT_SECONDS = 600
+
+
+class NoAnswer(str):
+	"""
+	The reason status_snapshot gives a host that did not answer in time.
+
+	A string, so logs and every caller read it as before, but one the
+	interface can recognise: it is the bot's own wording, not Docker's, and
+	so the one reason it can say in the user's language.
+	"""
+
+	def __new__(cls, seconds):
+		reason = super().__new__(cls, f"no answer in {seconds}s")
+		reason.seconds = seconds
+		return reason
+
+
+class HostRejected(Exception):
+	"""
+	Raised when a host is not worth even trying to reach.
+
+	Separate from HostUnavailable because the fix is different: the machine may
+	well be up, it is what was typed that cannot be registered.
+
+	`reason` is one of "scheme" or "duplicate", so the caller picks the message
+	instead of parsing text. "duplicate" covers the same URL and the same daemon
+	reached under a different one alike. Changing a host's URL adds "same" (the
+	URL it already has), "local" (the host the bot runs on, which keeps its
+	socket) and "missing" (a host no longer configured).
+	"""
+
+	def __init__(self, reason):
+		super().__init__(reason)
+		self.reason = reason
+
+
+class HostUnavailable(Exception):
+	"""
+	Raised when a host cannot be reached.
+
+	Its own exception type because one host being down must never take the bot
+	with it: callers catch this and carry on with the hosts that answer.
+	"""
+
+	def __init__(self, host_id, reason):
+		super().__init__(f"Host {host_id} is unavailable: {reason}")
+		self.host_id = host_id
+		self.reason = reason
+
+
+_lock = threading.RLock()
+# Clients are cached per host, together with the URL they were built from, so
+# that changing a host's URL rebuilds it instead of reusing a stale connection.
+_clients = {}
+
+# Reachability checks in flight, and the outcomes they left behind. A ping that
+# blocks past the deadline cannot be cancelled, so it is remembered instead: the
+# next sweep reuses it rather than piling a second thread on the same host.
+_probe_lock = threading.Lock()
+_probes = {}
+_probe_results = {}
+# Probe clients are cached separately from the working ones. They differ only in
+# their timeout, and sharing a cache would mean whichever ran first decided how
+# long every later operation waits.
+_probe_clients = {}
+# Clients for operations that legitimately take minutes. Cached apart for the
+# same reason as the probe ones.
+_slow_clients = {}
+
+
+def hosts(include_paused=False):
+	"""
+	Every configured host that is in use, in the order they were added.
+
+	Read from the settings on each call: a host added from Telegram has to show
+	up without restarting.
+
+	A paused host is left out by default, which is what makes a pause mean
+	something: everything that sweeps the fleet goes through here, so one flag
+	takes the machine out of the listings, the update checks, the pickers and
+	its own event monitor without any of them knowing about pausing at all.
+	The default is the quiet one on purpose — a sweep nobody remembered to
+	adapt leaves a paused host alone rather than going on knocking at it.
+
+	`include_paused` is for the few that have to see the whole configuration:
+	the settings screens, which are where it gets unpaused, and the bookkeeping
+	that must not reuse a paused host's id or its URL.
+	"""
+	configured = store.get("hosts") or []
+	return [host for host in configured
+			if isinstance(host, dict) and host.get("id")
+			and (include_paused or not host.get("paused"))]
+
+
+def host(host_id):
+	"""One host by id, or None. Paused ones included: this is how they are read back."""
+	for candidate in hosts(include_paused=True):
+		if candidate["id"] == host_id:
+			return candidate
+	return None
+
+
+def is_paused(host_id):
+	"""Whether `host_id` is paused, and so left out of every sweep."""
+	entry = host(host_id)
+	return bool(entry and entry.get("paused"))
+
+
+def set_paused(host_id, paused):
+	"""
+	Pauses or resumes a host, and says whether it did.
+
+	The local host cannot be paused, for the same reason it cannot be removed:
+	the bot runs on it. Nothing else is touched — the entry keeps its URL, its
+	certificates and its name, and the schedules pointing at it keep pointing
+	at it. That is the whole difference from removing it.
+	"""
+	with _lock:
+		configured = hosts(include_paused=True)
+		for entry in configured:
+			if entry["id"] != host_id:
+				continue
+			if paused and entry.get("local"):
+				warning("Refusing to pause the local host: the bot itself runs on it")
+				return False
+			if bool(entry.get("paused")) == bool(paused):
+				return False
+			if paused:
+				entry["paused"] = True
+			else:
+				entry.pop("paused", None)
+			store.set("hosts", configured)
+			debug(f"Host {entry.get('alias', host_id)} {'paused' if paused else 'resumed'}")
+			return True
+	return False
+
+
+def local_host_id():
+	"""
+	The id of the host the bot itself runs on.
+
+	The self-update path has to be pinned to it: the bot's own container only
+	exists on one host, and updating it anywhere else would look for a
+	container that is not there.
+	"""
+	# The whole configuration, paused hosts included: the local one can never be
+	# paused, but the fallback below must not start answering with a different
+	# machine just because the first host was.
+	configured = hosts(include_paused=True)
+	for candidate in configured:
+		if candidate.get("local"):
+			return candidate["id"]
+	# No local host registered yet (migration has not run, or someone edited it
+	# out); the first host is a better guess than nothing.
+	return configured[0]["id"] if configured else None
+
+
+def is_single_host():
+	"""
+	True while only one host is in use.
+
+	The whole interface hangs off this: with a single host the host level is
+	never shown anywhere, so the bot looks exactly as it did before hosts
+	existed.
+
+	A paused host does not count. While it is paused there really is only one
+	machine answering, and the bot talks like it — which also means the host
+	names come back the moment it is resumed.
+	"""
+	return len(hosts()) <= 1
+
+
+def alias(host_id):
+	"""A host's display name, falling back to its id."""
+	entry = host(host_id)
+	return (entry.get("alias") or host_id) if entry else host_id
+
+
+def find_by_alias(name):
+	"""
+	The host whose alias matches `name`, case-insensitively, or None.
+
+	Used by the `nas:firefox` shorthand.
+	"""
+	wanted = (name or "").strip().lower()
+	if not wanted:
+		return None
+	for candidate in hosts():
+		if str(candidate.get("alias", "")).lower() == wanted:
+			return candidate
+	return None
+
+
+def generate_host_id():
+	"""A short id no configured host is using."""
+	import uuid
+
+	# Paused hosts included: theirs is taken too, and handing it out again
+	# would make two entries the same machine on the day one is resumed.
+	taken = {candidate["id"] for candidate in hosts(include_paused=True)}
+	while True:
+		candidate = f"h_{uuid.uuid4().hex[:4]}"
+		if candidate not in taken:
+			return candidate
+
+
+# ---------------------------------------------------------------------------
+# Clients
+# ---------------------------------------------------------------------------
+
+def _build_client(entry, verify=False, timeout=None):
+	"""
+	Opens a Docker client for one host.
+
+	`verify` pings the daemon before handing the client back. It is off by
+	default on purpose: the bot has always started even when Docker was not
+	answering yet, and pinging here would turn a slow daemon at boot into a
+	container that refuses to start. Callers that need to know now — adding a
+	host, sweeping every host — ask for it explicitly.
+
+	The SDK handles unix://, tcp:// and ssh:// itself. ssh:// additionally needs
+	paramiko, which is reported as a missing dependency rather than as a
+	connection failure, because the two have completely different fixes.
+
+	`timeout` overrides what the host is configured with, and exists for the
+	reachability checks: the SDK applies the timeout to every request, so the
+	value that lets the slowest legitimate request finish is far too long to
+	spend finding out that a machine is unplugged.
+	"""
+	import docker
+
+	url = entry.get("url") or LOCAL_SOCKET_URL
+	host_id = entry["id"]
+
+	if timeout is None:
+		timeout = int(entry.get("timeout") or DEFAULT_TIMEOUT_SECONDS)
+	kwargs = {"base_url": url, "timeout": timeout}
+
+	if url.startswith("ssh://"):
+		# The SDK imports paramiko to load its ssh transport at all, even when
+		# the connection itself is handed to the ssh binary. The image ships
+		# both; a custom build without them gets told which is missing, since a
+		# missing dependency and an unreachable machine have different fixes.
+		try:
+			import paramiko  # noqa: F401
+		except ImportError:
+			raise HostUnavailable(host_id, "ssh:// needs the py3-paramiko package, which this image does not have")
+		if not shutil.which("ssh"):
+			raise HostUnavailable(host_id, "ssh:// needs the ssh client, which this image does not have")
+
+		# Hand the connection to the system ssh client rather than letting
+		# paramiko dial it. That is what makes ~/.ssh/config, known_hosts and
+		# the agent work, so a host that answers `ssh nas` answers here too and
+		# is debugged the same way.
+		kwargs["use_ssh_client"] = True
+
+	# TLS for a tcp:// host. The certificates are files mapped into the
+	# container; only their paths are ever stored.
+	certs = entry.get("tls") or {}
+	if certs:
+		try:
+			from docker.tls import TLSConfig
+
+			kwargs["tls"] = TLSConfig(
+				client_cert=(certs["cert"], certs["key"]) if certs.get("cert") else None,
+				ca_cert=certs.get("ca"),
+				verify=bool(certs.get("verify", True)),
+			)
+		except Exception as e:
+			raise HostUnavailable(host_id, f"invalid TLS configuration: {e}")
+
+	try:
+		built = docker.DockerClient(**kwargs)
+	except Exception as e:
+		raise HostUnavailable(host_id, str(e))
+	if url.startswith("ssh://"):
+		_reuse_ssh_connections(built, host_id)
+	if verify:
+		try:
+			built.ping()
+		except Exception as e:
+			# Built and then failed: over ssh that client already has a
+			# process behind it, which nobody would ever close.
+			_close((("", built),), host_id)
+			raise HostUnavailable(host_id, str(e))
+	return built
+
+
+def _readable_within(fd, timeout):
+	"""Whether `fd` has something to read, or has reached its end, within `timeout` seconds."""
+	# poll() wherever there is one, as the SDK does: select() cannot watch a
+	# descriptor numbered past 1024.
+	if hasattr(select, "poll"):
+		poller = select.poll()
+		poller.register(fd, select.POLLIN)
+		return bool(poller.poll(max(0.0, timeout) * 1000))
+	return bool(select.select([fd], [], [], max(0.0, timeout))[0])
+
+
+class _TimedPipe(io.RawIOBase):
+	"""
+	The stdout of an ssh:// host's `ssh … docker system dial-stdio`, read with a
+	timeout.
+
+	Every response from an ssh:// host comes down that pipe, and the SDK reads
+	it as it is: blocking, with no deadline. The timeout the SDK and urllib3 set
+	lands on the socket object the SDK wraps the process in, which is never read
+	from, so none of the bot's timeouts —the working one, the probe's, the
+	prunes'— ever applied over ssh. A daemon that stopped answering while sshd
+	was still up held whatever thread asked it something for good: the
+	scheduler's, or one of telebot's for every button pressed, until the bot
+	stopped answering altogether.
+
+	`timeout` is called on every read rather than fixed here: the connection is
+	reused, and urllib3 sets each request's own before reading its response.
+	None waits for as long as it takes, which is what the event stream asks
+	for. Running out raises socket.timeout, as a socket would, which urllib3
+	turns into a read timeout — and which makes it discard the connection
+	instead of reusing it, since the rest of that response is still on its way
+	down the pipe and the next request would read it as its own.
+
+	Meant to sit under an io.BufferedReader, which only comes here when it has
+	nothing left to hand back: data already read never waits on the pipe. The
+	descriptor is the process's, and goes with it; nothing here closes it.
+	"""
+
+	def __init__(self, stdout, timeout):
+		super().__init__()
+		# The file, not just its number: while this reads from it, nothing must
+		# close the descriptor and hand the number to something else.
+		self._stdout = stdout
+		self._fd = stdout.fileno()
+		self._timeout = timeout
+
+	def readable(self):
+		return True
+
+	def fileno(self):
+		return self._fd
+
+	def readinto(self, buffer):
+		timeout = self._timeout()
+		if timeout is not None and not _readable_within(self._fd, timeout):
+			raise socket.timeout("timed out")
+		return os.readv(self._fd, [buffer])
+
+
+def _reuse_ssh_connections(client, host_id):
+	"""
+	Makes an ssh:// client keep its connection between requests.
+
+	With use_ssh_client the SDK's ssh adapter builds a new connection pool on
+	every request and keeps none of them: its get_connection only stores the
+	pool when paramiko dials (docker/transport/sshconn.py, the same in 7.1.0
+	and 7.2.0). Every API call therefore spawned another `ssh … docker system
+	dial-stdio`: a TCP connection, a full ssh handshake and a docker CLI
+	start-up, more than half a second over a VPN, before the request itself
+	was even sent. Listing fourteen containers the SDK's way was fifteen of
+	those, nine seconds, and every one of them leaked its process and a file
+	descriptor until garbage collection.
+
+	The adapter is handed the one pool per client it would have had with
+	paramiko. The ssh process behind a pooled connection stays up between
+	requests, so a request after the first costs a round-trip and not a
+	handshake, and the adapter's close() —what drop() and _close() end up
+	calling— ends it as it always did. A connection whose ssh process has
+	exited —the host rebooted, its daemon restarted, the link dropped— is
+	replaced rather than written to.
+
+	While at it, the connection's responses are read with the request's timeout
+	(see _TimedPipe), and a pool that was closed is opened again on the next
+	request, as tcp:// and unix:// already do.
+
+	Returns whether the client was changed; False for a client that does not
+	dial through the ssh binary, which the SDK already pools.
+	"""
+	adapter = getattr(getattr(client, "api", None), "_custom_adapter", None)
+	try:
+		from docker.transport.sshconn import SSHConnection, SSHConnectionPool, SSHHTTPAdapter, SSHSocket
+	except ImportError:
+		return False
+	if not isinstance(adapter, SSHHTTPAdapter) or adapter.ssh_client is not None:
+		return False
+
+	class Stdout:
+		"""
+		The ssh process's stdout as http.client reads responses from it,
+		minus close().
+
+		http.client closes the file it read a response from once the
+		response is consumed. The SDK's socket hands it the process's own
+		stdout, so the first response closed the pipe and the connection
+		was good for exactly one request. The pool owns the process, and
+		ends it when the connection is closed.
+		"""
+		def __init__(self, stdout, channel):
+			self._stdout = stdout
+			# What the SDK reads an exec's or attach's raw stream from.
+			self.channel = channel
+
+		def close(self):
+			pass
+
+		def __getattr__(self, name):
+			return getattr(self._stdout, name)
+
+	class ReusableSocket(SSHSocket):
+		def __init__(self, host):
+			super().__init__(host)
+			self._reader = None
+			self._untimed = False
+
+		def connect(self, **kwargs):
+			super().connect(**kwargs)
+			# One reader per process, shared by every response read from it
+			# and by the raw stream of an exec, so nothing one of them has
+			# buffered is lost to the other.
+			self._reader = io.BufferedReader(_TimedPipe(self.proc.stdout, self._read_timeout))
+
+		def _read_timeout(self):
+			# What urllib3 and the SDK set on this socket, which is the only
+			# thing they can set: they never see the pipe.
+			return None if self._untimed else self.gettimeout()
+
+		def makefile(self, mode):
+			if not self.proc:
+				self.connect()
+			return Stdout(self._reader, self)
+
+		def recv(self, n):
+			# The raw stream of an exec or an attach. The SDK reads it only
+			# after polling the connection with no deadline, so over a socket
+			# the client's timeout never bounds one; over ssh it should not
+			# start to, and a quiet command cut short here would run on to the
+			# end anywhere else.
+			if not self.proc:
+				return super().recv(n)
+			self._untimed = True
+			try:
+				return self._reader.read(n)
+			finally:
+				self._untimed = False
+
+		def close(self):
+			try:
+				super().close()
+			except Exception:
+				# Already gone: nothing left to say goodbye to.
+				pass
+
+	class ReusableConnection(SSHConnection):
+		def connect(self):
+			sock = ReusableSocket(self.ssh_host)
+			sock.settimeout(self.timeout)
+			sock.connect()
+			self.sock = sock
+
+	class PersistentPool(SSHConnectionPool):
+		def _new_conn(self):
+			return ReusableConnection(None, self.timeout, self.ssh_host)
+
+		def _get_conn(self, timeout):
+			conn = super()._get_conn(timeout)
+			process = getattr(getattr(conn, "sock", None), "proc", None)
+			if process is not None and process.poll() is not None:
+				debug(f"The ssh connection to host {host_id} had ended; opening another")
+				try:
+					conn.close()
+				except Exception:
+					pass
+				conn = self._new_conn()
+			return conn
+
+	def open_pool():
+		pool = PersistentPool(timeout=adapter.timeout, maxsize=adapter.max_pool_size, host=adapter.ssh_host)
+		# Where the adapter keeps the pools it closes.
+		adapter.pools[adapter.ssh_host] = pool
+		return pool
+
+	def get_connection(url, proxies=None):
+		# Opened again once closed. drop() closes the client of a host that
+		# failed, but whoever already holds that client —an update halfway
+		# through, a project being restarted— goes on using it, and a closed
+		# pool refuses every request with "Pool is closed" from then on: an
+		# update cut by a ten-second outage could not even roll itself back.
+		# Under the adapter's own lock, so threads that find it closed at
+		# once share the one pool they open; and a pool close() has already
+		# taken out of the adapter counts as closed, even before it is.
+		with adapter.pools.lock:
+			pool = adapter.pools.get(adapter.ssh_host)
+			if pool is None or pool.pool is None:
+				pool = open_pool()
+			return pool
+
+	try:
+		open_pool()
+		adapter.get_connection = get_connection
+	except Exception as e:
+		# Never a reason not to reach the host: without it, every request
+		# merely pays the handshake, as it did before.
+		warning(f"Could not keep the ssh connection to host {host_id} open: {e}")
+		return False
+	debug(f"Host {host_id}: ssh connection kept open between requests")
+	return True
+
+
+def _cached_client(cache, entry, timeout=None, announce=False):
+	"""
+	The cached client for a host, building one when the cache has none.
+
+	The build happens outside the lock on purpose. The SDK asks the daemon for
+	its API version while the client is being constructed, so building one for
+	a machine that is not answering takes as long as its timeout — and holding
+	the registry lock for that puts every other host behind the one that is
+	down, which is the very thing the parallel sweeps exist to avoid.
+
+	The price is that two threads can build a client for the same host at the
+	same time. The first to publish wins and the other's is closed straight
+	away: one connection too many in a race, never one left open.
+
+	`announce` logs the connection. Only the working client does: the probe
+	opens one to the same daemon, and logging both would double every line.
+	"""
+	host_id = entry["id"]
+	url = entry.get("url") or LOCAL_SOCKET_URL
+	with _lock:
+		cached = cache.get(host_id)
+		if cached and cached[0] == url:
+			return cached[1]
+
+	built = _build_client(entry, timeout=timeout)
+
+	with _lock:
+		current = host(host_id)
+		if current is None or (current.get("url") or LOCAL_SOCKET_URL) != url:
+			# The host was reconfigured while this was connecting, so what came
+			# back answers for a machine nobody is asking about any more.
+			# Caching it would serve the old daemon from then on.
+			winner, discarded = None, (url, built)
+		else:
+			cached = cache.get(host_id)
+			if cached and cached[0] == url:
+				# Another thread got there first while this one was connecting.
+				winner, discarded = cached[1], (url, built)
+			else:
+				# What it displaces belongs to a URL nobody will ask for again.
+				# Same leak as drop(): its ssh process outlives it until
+				# somebody closes it.
+				winner, discarded = built, cache.get(host_id)
+				cache[host_id] = (url, built)
+
+	# Outside the lock: an ssh teardown is not instant, and nothing else needs
+	# to wait on it to look up a different host.
+	_close((discarded,), host_id)
+	if winner is None:
+		raise HostUnavailable(host_id, "its connection details changed while it was being reached")
+	if announce and winner is built:
+		debug(f"Connected to host {entry.get('alias', host_id)} ({url})")
+	return winner
+
+
+def client(host_id):
+	"""
+	A live client for `host_id`, building and caching it on first use.
+
+	Raises HostUnavailable when the host cannot be reached, so a caller that
+	iterates over hosts can skip the ones that are down.
+	"""
+	entry = host(host_id)
+	if entry is None:
+		raise HostUnavailable(host_id, "not configured")
+	return _cached_client(_clients, entry, announce=True)
+
+
+def try_client(host_id):
+	"""The client for `host_id`, or None when it cannot be built."""
+	try:
+		return client(host_id)
+	except HostUnavailable as e:
+		warning(str(e))
+		return None
+
+
+def probe_client(host_id):
+	"""
+	A short-timeout client for `host_id`, used only to ask whether it is there.
+
+	Separate from the working client because the SDK's timeout applies to every
+	request, not just to connecting. The working client has to wait long enough
+	for the slowest legitimate answer, while a reachability check that waits
+	that long turns an unplugged machine into half a minute of a menu looking
+	frozen.
+
+	Raises HostUnavailable, like client().
+	"""
+	entry = host(host_id)
+	if entry is None:
+		raise HostUnavailable(host_id, "not configured")
+	return _cached_client(_probe_clients, entry, timeout=PROBE_TIMEOUT_SECONDS)
+
+
+def slow_client(host_id):
+	"""
+	A long-timeout client for `host_id`, for the operations that legitimately
+	take minutes: the prunes.
+
+	Separate from the working client because the SDK's timeout applies to every
+	request, and raising that one for everything would leave a host that stops
+	answering looking frozen for ten minutes instead of thirty seconds.
+
+	Raises HostUnavailable, like client().
+	"""
+	entry = host(host_id)
+	if entry is None:
+		raise HostUnavailable(host_id, "not configured")
+	return _cached_client(_slow_clients, entry, timeout=SLOW_TIMEOUT_SECONDS)
+
+
+def ping(host_id):
+	"""
+	Whether `host_id` answers right now.
+
+	Asked through the probe client, so a host that has gone away is reported as
+	down in seconds rather than after a full operation timeout.
+
+	A cached client whose connection has gone bad is dropped, so the next use
+	reconnects instead of reusing a dead socket.
+	"""
+	try:
+		connection = probe_client(host_id)
+	except HostUnavailable as e:
+		warning(str(e))
+		return False
+	try:
+		connection.ping()
+		return True
+	except Exception as e:
+		warning(f"Host {alias(host_id)} stopped answering: {e}")
+		drop(host_id)
+		return False
+
+
+def _close(entries, host_id):
+	"""
+	Hands discarded clients' resources back, given their cache entries.
+
+	Forgetting a client is not the same as releasing it. Behind an `ssh://` one
+	there is an `ssh ... docker system dial-stdio` process, and drop() runs
+	every time a connection goes bad — which for the event monitor is once per
+	reconnection attempt. A host with a flaky link would leave abandoned ssh
+	processes piling up inside the container for days.
+
+	Takes the `(url, client)` entries the caches hold rather than bare clients,
+	so no caller has to remember to unwrap them.
+
+	Closing one that is already dead can raise, and by then there is nothing
+	left to salvage: the client is gone from the cache either way.
+	"""
+	for entry in entries:
+		if not entry:
+			continue
+		try:
+			entry[1].close()
+		except Exception as e:
+			debug(f"Could not close the client for host {host_id}: {e}")
+
+
+def drop(host_id):
+	"""
+	Forgets the cached clients for a host, and closes them.
+
+	Called when a host's connection details change, and when a connection goes
+	bad so that the next use reconnects instead of reusing a dead socket. The
+	working, probe and slow clients all go: they point at the same daemon, and
+	leaving one behind means the next check answers about a connection the rest
+	of the bot has already given up on.
+	"""
+	with _lock:
+		removed = _clients.pop(host_id, None)
+		probe = _probe_clients.pop(host_id, None)
+		slow = _slow_clients.pop(host_id, None)
+	# Outside the lock: an ssh teardown is not instant, and nothing else needs
+	# to wait on it to look up a different host.
+	_close((removed, probe, slow), host_id)
+	if removed:
+		debug(f"Dropped the cached client for host {host_id}")
+
+
+def reachable_hosts(deadline_seconds=PROBE_TIMEOUT_SECONDS):
+	"""
+	Every host that answers right now, as (host, client) pairs.
+
+	Anything that has to sweep every host goes through here, so one machine
+	being down degrades that sweep instead of breaking it.
+
+	Reachability comes from the parallel snapshot with a deadline, not from
+	pinging one host after another: a machine that hangs would otherwise hold
+	the whole sweep for its probe timeout, and then again for every host
+	behind it.
+
+	The client handed back is the working one, not the probe that answered the
+	ping: callers operate through it, and they must not inherit the short
+	timeout that only makes sense for asking whether a host is there.
+	"""
+	configured = hosts()
+	if not configured:
+		return []
+	statuses = status_snapshot(deadline_seconds=deadline_seconds, entries=configured)
+	pairs = []
+	for entry in configured:
+		ok, _ = statuses.get(entry["id"], (False, ""))
+		if not ok:
+			continue
+		try:
+			pairs.append((entry, client(entry["id"])))
+		except HostUnavailable as e:
+			warning(str(e))
+	return pairs
+
+
+def host_status(host_id, deadline_seconds=5):
+	"""
+	Whether one host answers, as (ok, reason).
+
+	For the screens that show a single machine: sweeping the whole fleet to
+	draw one host means waiting on every other one as well.
+	"""
+	entry = host(host_id)
+	if entry is None:
+		return False, ""
+	return status_snapshot(deadline_seconds, entries=[entry]).get(host_id, (False, ""))
+
+
+def status_snapshot(deadline_seconds=PROBE_TIMEOUT_SECONDS, entries=None):
+	"""
+	Whether each host answers, as {host_id: (ok, reason)}.
+
+	Every host is checked at the same time, on its own thread, and the whole
+	thing gives up after `deadline_seconds` no matter how many there are. A
+	menu that pinged hosts one after another would hang for the sum of their
+	timeouts, so opening it with one machine unplugged would look like the bot
+	had frozen.
+
+	A host that has not answered by the deadline is reported as failing, with
+	the deadline as the reason: from the user's side "did not answer in five
+	seconds" and "refused the connection" both mean the same thing, which is
+	that it cannot be used right now.
+
+	Giving up on the deadline does not stop the ping — a blocking socket read
+	cannot be cancelled — so a check still running is remembered and no second
+	one is started for that host. Otherwise a machine that hangs for a minute
+	would leave a thread behind on every refresh of the menu.
+
+	The probe client is what does the asking, so an abandoned check gives up on
+	its own shortly after the deadline instead of holding a thread for as long
+	as a real operation is allowed to take.
+	"""
+	configured = hosts() if entries is None else entries
+
+	def check(entry):
+		host_id = entry["id"]
+		broken = False
+		try:
+			connection = probe_client(host_id)
+			connection.ping()
+			outcome = (True, "")
+		except HostUnavailable as e:
+			outcome = (False, e.reason)
+		except Exception as e:
+			broken = True
+			outcome = (False, str(e))
+		with _probe_lock:
+			# A check started before the host's URL changed says nothing about
+			# the new one: change_url forgot it, and it must neither answer
+			# for the host nor close the clients just built for the new URL.
+			if _probes.get(host_id) is not threading.current_thread():
+				return
+			# Stamped with when it finished: two sweeps can share a check, and
+			# each needs to tell an answer given during it from one left over.
+			_probe_results[host_id] = (time.monotonic(), outcome)
+			_probes.pop(host_id, None)
+		if broken:
+			drop(host_id)
+
+	started = time.monotonic()
+	threads = []
+	for entry in configured:
+		host_id = entry["id"]
+		with _probe_lock:
+			pending = _probes.get(host_id)
+			if pending is not None and pending.is_alive():
+				# Waited on rather than skipped. Skipping left this sweep
+				# nothing to read but "no answer", often at once, whenever two
+				# ran together —the first update pass and the start-up message
+				# always do— and a healthy host was reported down.
+				threads.append(pending)
+				continue
+			thread = threading.Thread(target=check, args=(entry,), daemon=True)
+			_probes[host_id] = thread
+		thread.start()
+		threads.append(thread)
+
+	deadline = started + deadline_seconds
+	for thread in threads:
+		thread.join(max(0, deadline - time.monotonic()))
+
+	missing = (False, NoAnswer(deadline_seconds))
+	with _probe_lock:
+		report = {}
+		for entry in configured:
+			# Read, not consumed, so a sweep sharing the check sees it too; and
+			# only an answer given since this sweep began counts as its own.
+			stamped = _probe_results.get(entry["id"])
+			report[entry["id"]] = stamped[1] if stamped and stamped[0] >= started else missing
+		return report
+
+
+def same_url(one, other):
+	"""
+	Whether two host URLs point at the same daemon.
+
+	Only the obvious differences are folded in — a missing URL means the local
+	socket, and a trailing slash is not a different machine. Nothing here tries
+	to resolve names: two different URLs for one daemon are caught by asking
+	the daemons themselves, in add_host.
+	"""
+	return ((one or LOCAL_SOCKET_URL).strip().rstrip("/")
+			== (other or LOCAL_SOCKET_URL).strip().rstrip("/"))
+
+
+def _daemon_identity(connection):
+	"""
+	What tells one Docker daemon from another, or None when it cannot be read.
+
+	The ID the daemon gives in /info, which is what says that two URLs reach the
+	same one, together with its name: the ID is generated once per install, and
+	machines cloned from one image with Docker already set up can share it.
+	"""
+	try:
+		info = connection.info()
+	except Exception as e:
+		debug(f"Could not read a daemon's ID: {e}")
+		return None
+	daemon_id = info.get("ID") if isinstance(info, dict) else None
+	if not isinstance(daemon_id, str) or not daemon_id:
+		return None
+	return (daemon_id, info.get("Name") or "")
+
+
+def _registered_with_daemon(identity, exclude=None):
+	"""
+	The registered host whose daemon is `identity`, or None.
+
+	For the duplicate same_url cannot see: the local socket and a tcp:// or
+	ssh:// to the same machine are two URLs for one daemon. Registered under the
+	second alias, the bot's own container shows up there as one more, and can
+	be stopped or removed from it.
+
+	Every host is asked at the same time, paused ones included —as for the URL,
+	a paused host is still configured—, through a client built for the purpose
+	and closed straight away: a cached one would leave a paused host with an ssh
+	process nobody uses. One that does not answer within the probe timeout, or
+	does not say, is passed over: a check that could not be made is no reason
+	to refuse a host.
+	"""
+	found = []
+	found_lock = threading.Lock()
+
+	def ask(entry):
+		try:
+			connection = _build_client(entry, timeout=PROBE_TIMEOUT_SECONDS)
+		except HostUnavailable:
+			return
+		try:
+			if _daemon_identity(connection) == identity:
+				with found_lock:
+					found.append(entry)
+		finally:
+			_close((("", connection),), entry["id"])
+
+	threads = [threading.Thread(target=ask, args=(entry,), daemon=True)
+			   for entry in hosts(include_paused=True) if entry["id"] != exclude]
+	for thread in threads:
+		thread.start()
+	deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+	for thread in threads:
+		thread.join(max(0, deadline - time.monotonic()))
+	with found_lock:
+		return found[0] if found else None
+
+
+def add_host(alias_name, url, tls=None, timeout=None):
+	"""
+	Registers a new host and returns its entry.
+
+	The client is opened straight away: a host that cannot be reached is worth
+	rejecting at the point someone adds it, while they still have the details
+	in front of them.
+
+	Raises HostRejected before that for a transport the SDK does not speak, and
+	for a machine that is already registered: a second entry for the local
+	socket would come in without `local`, so the guard in remove_host would not
+	protect it, it would show up twice in every listing and its update cache
+	would drift between the two ids. And after it, once the daemon has answered,
+	for one already registered under a different URL — the same refusal, since
+	it is the same mistake.
+	"""
+	url = (url or "").strip()
+	if not url.startswith(SUPPORTED_SCHEMES):
+		raise HostRejected("scheme")
+	# Against the whole configuration: a paused host is still configured, and
+	# adding its URL again would leave two entries for one machine.
+	if any(same_url(existing.get("url"), url) for existing in hosts(include_paused=True)):
+		raise HostRejected("duplicate")
+
+	entry = {"id": generate_host_id(), "alias": alias_name, "url": url, "local": False}
+	if tls:
+		entry["tls"] = tls
+	if timeout:
+		entry["timeout"] = int(timeout)
+
+	# Only to find out whether it answers, and which daemon it is, so it is
+	# closed straight away: the working client is built on first use, like
+	# every other host's.
+	checked = _build_client(entry, verify=True)  # raises HostUnavailable
+	try:
+		identity = _daemon_identity(checked)
+	finally:
+		_close((("", checked),), entry["id"])
+	if identity is not None:
+		twin = _registered_with_daemon(identity)
+		if twin is not None:
+			debug(f"Host {url} reaches the same Docker daemon as host {twin.get('alias', twin['id'])} "
+				  f"({twin.get('url') or LOCAL_SOCKET_URL})")
+			raise HostRejected("duplicate")
+
+	with _lock:
+		configured = hosts(include_paused=True)
+		# Checked again under the lock: verifying the connection takes long
+		# enough for the same host to have been added meanwhile.
+		if any(same_url(existing.get("url"), url) for existing in configured):
+			raise HostRejected("duplicate")
+		configured.append(entry)
+		store.set("hosts", configured)
+	debug(f"Registered host {alias_name} ({url}) as {entry['id']}")
+	return entry
+
+
+def remove_host(host_id):
+	"""
+	Removes a host. The local one cannot be removed: the bot runs on it.
+
+	Returns True when something was removed.
+	"""
+	entry = host(host_id)
+	if entry is None:
+		return False
+	if entry.get("local"):
+		warning("Refusing to remove the local host: the bot itself runs on it")
+		return False
+
+	# The host and the settings of its containers in one write: those have
+	# nowhere left to apply, and come back under no id if the machine is added
+	# again.
+	with _lock, store.batch("settings"):
+		store.set("hosts", [h for h in hosts(include_paused=True) if h["id"] != host_id])
+		store.forget_host_containers(host_id)
+	drop(host_id)
+	store.forget_host_updates(host_id)
+	debug(f"Removed host {host_id}")
+	return True
+
+
+def _with_url(entry, url):
+	"""
+	A host entry pointed at `url`, the rest kept.
+
+	The TLS certificates go when the URL is no longer tcp://: they are for a
+	TLS daemon socket, and an ssh:// client handed them fails to build.
+	"""
+	moved = dict(entry)
+	moved["url"] = url
+	if not url.startswith("tcp://"):
+		moved.pop("tls", None)
+	return moved
+
+
+def probe_new_url(host_id, url):
+	"""
+	Checks a new URL for a host before it is changed to it.
+
+	The same checks as adding a host —a transport the SDK speaks, not a URL or
+	a daemon already registered as another host, a daemon that answers—, plus
+	the ones only a change has: a URL different from the one it has, and not
+	the local host, whose socket is where the bot itself runs.
+
+	Returns whether the new URL reaches the same daemon as the current one:
+	True, False, or None when that cannot be told —the current URL does not
+	answer, which is the usual reason to change it, or a daemon does not say
+	who it is. Raises HostRejected or HostUnavailable as add_host does.
+	"""
+	url = (url or "").strip()
+	entry = host(host_id)
+	if entry is None:
+		raise HostRejected("missing")
+	if entry.get("local"):
+		raise HostRejected("local")
+	if not url.startswith(SUPPORTED_SCHEMES):
+		raise HostRejected("scheme")
+	if same_url(entry.get("url"), url):
+		raise HostRejected("same")
+	if any(same_url(other.get("url"), url) for other in hosts(include_paused=True) if other["id"] != host_id):
+		raise HostRejected("duplicate")
+
+	checked = _build_client(_with_url(entry, url), verify=True)  # raises HostUnavailable
+	try:
+		identity = _daemon_identity(checked)
+	finally:
+		_close((("", checked),), host_id)
+	if identity is None:
+		return None
+	twin = _registered_with_daemon(identity, exclude=host_id)
+	if twin is not None:
+		debug(f"Host {url} reaches the same Docker daemon as host {twin.get('alias', twin['id'])}")
+		raise HostRejected("duplicate")
+
+	before = _identity_within(entry, PROBE_TIMEOUT_SECONDS)
+	return None if before is None else before == identity
+
+
+def _identity_within(entry, seconds):
+	"""
+	Which daemon a host's URL reaches, or None when it does not say in time.
+
+	On a thread of its own, given up on after `seconds`: a URL being changed
+	is usually one that no longer answers, and over ssh:// building the
+	client already asks the daemon, through a pipe with no deadline of its
+	own, so a hung daemon behind a live sshd held the admin's request —and a
+	worker— for good. The thread is left to finish on its own, and closes
+	what it opened.
+	"""
+	found = []
+
+	def ask():
+		try:
+			connection = _build_client(entry, timeout=seconds)
+		except Exception as e:
+			debug(f"Could not ask the current URL of host {entry['id']} which daemon it is: {e}")
+			return
+		try:
+			found.append(_daemon_identity(connection))
+		finally:
+			_close((("", connection),), entry["id"])
+
+	thread = threading.Thread(target=ask, daemon=True)
+	thread.start()
+	thread.join(seconds)
+	return found[0] if found else None
+
+
+def change_url(host_id, url):
+	"""
+	Points a host at a new URL, keeping its id.
+
+	Everything kept against the id stays with it: the settings of its
+	containers, its schedules and its update cache. Removing the host and
+	adding it again was the only way to change one, and that gave it a new
+	id and lost all three.
+
+	Checked again here, under the lock adding and removing take: probing the
+	new URL takes long enough for another admin to have registered it as a
+	host meanwhile. Its clients are closed, so the next use connects to the
+	new URL.
+	"""
+	url = (url or "").strip()
+	with _lock:
+		configured = hosts(include_paused=True)
+		target = next((entry for entry in configured if entry["id"] == host_id), None)
+		if target is None:
+			raise HostRejected("missing")
+		if target.get("local"):
+			raise HostRejected("local")
+		if any(same_url(entry.get("url"), url) for entry in configured if entry["id"] != host_id):
+			raise HostRejected("duplicate")
+		moved = _with_url(target, url)
+		target.clear()
+		target.update(moved)
+		store.set("hosts", configured)
+	# A check still running against the old URL would otherwise be waited on
+	# by the next sweep and taken for the new one's answer, as reset() avoids
+	# for a settings reload.
+	with _probe_lock:
+		_probes.pop(host_id, None)
+		_probe_results.pop(host_id, None)
+	drop(host_id)
+	debug(f"Host {host_id} now at {url}")
+	return True
+
+
+def rename_host(host_id, new_alias):
+	"""
+	Changes a host's display name.
+
+	Nothing is keyed on the alias, so this touches no cached state and no
+	schedule.
+
+	Under the same lock as adding and removing: this rewrites the whole list
+	from a copy it read, so a rename racing an add would drop the host that was
+	just added.
+	"""
+	with _lock:
+		configured = hosts(include_paused=True)
+		for entry in configured:
+			if entry["id"] == host_id:
+				entry["alias"] = new_alias
+				store.set("hosts", configured)
+				return True
+	return False
+
+
+def reset():
+	"""Drops every cached client. For tests, and after a settings reload."""
+	with _lock:
+		discarded = list(_clients.items()) + list(_probe_clients.items()) + list(_slow_clients.items())
+		_clients.clear()
+		_probe_clients.clear()
+		_slow_clients.clear()
+	for host_id, entry in discarded:
+		_close((entry,), host_id)
+	with _probe_lock:
+		# The threads themselves are daemons and cannot be stopped; forgetting
+		# them keeps a check against the old settings from being reused.
+		_probes.clear()
+		_probe_results.clear()

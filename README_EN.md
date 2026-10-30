@@ -110,8 +110,9 @@ volumes:
 - 📦 **Containers:** list, start, stop, restart and remove. With multi-selection on `/run`, `/stop` and `/restart`.
 - 🧩 **Compose:** detects your projects and groups them (project → containers).
 - 📊 **Diagnostics:** logs in the chat or as a file, `exec` inside containers, ports and detailed info.
-- 🔄 **Updates:** tells you when a new image is out, updates one or all, changes tags (rollback) and auto-updates with labels.
-- ⏰ **Automation:** cron-scheduled tasks + temporary mute with `/mute` + cleanup with `/prune`.
+- 🔄 **Updates:** tells you when a new image is out, updates one or all, changes tags (rollback) and lets you choose, container by container, which ones update on their own and which aren't checked.
+- 🔔 **Notifications:** tells you when a container starts, stops, crashes, runs out of memory or fails its healthcheck, and you choose what each one tells you about: everything, problems only or nothing.
+- ⏰ **Automation:** cron-scheduled tasks + temporary mute with `/mute` or from a script with `dcb-mute` + cleanup with `/prune`.
 - 🖥️ **Multi-host & settings:** several servers from a single bot, everything tweakable with `/settings` without restarting.
 
 <details>
@@ -124,6 +125,7 @@ volumes:
 - ✅ Get logs directly on the chat or on a file
 - ✅ Extract the container's docker-compose
 - ✅ Notifications when a container starts or stops
+- ✅ Notifications per container: all, problems only or none, from `/info`, `/settings` or the `DCB-Notifications` label
 - ✅ Notifications when a container has a new image update
 - ✅ Updating of containers
 - ✅ Change tags (rollback or update)
@@ -136,7 +138,7 @@ volumes:
 - ✅ Works out which container it is on its own: nothing to tell it, and it still knows not to stop or delete itself
 - ✅ Settings editable from the bot itself with `/settings`, without touching the docker-compose or restarting
 - ✅ Button-based main menu in `/start`, grouped into categories; typed commands keep working exactly as before
-- ✅ Mute notifications temporarily
+- ✅ Mute notifications temporarily, also from a script with `dcb-mute`
 - ✅ Multi-architecture image (amd64, arm64, armv7…) compatible with Raspberry Pi, NAS and standard servers
 - ✅ Multilanguage support (Spanish, English, Dutch, German, Russian, Galician, Italian, Catalan)
 
@@ -190,6 +192,24 @@ From `/schedule` you can create tasks that run on a cron schedule.
 </details>
 
 <details>
+<summary>🔕 Mute the bot from a script</summary>
+
+A script can mute the bot without going through Telegram, for instance while it stops containers to back them up:
+
+```sh
+docker exec docker-controller-bot dcb-mute 60   # mute for 60 minutes
+docker exec docker-controller-bot dcb-mute 0    # unmute
+```
+
+- It waits for the bot to apply it, a couple of seconds, and exits non-zero if it has not.
+- The latest change wins, from the script or from `/mute`, longer or shorter.
+- Same limit as `/mute`.
+- If what you want is for the containers your backup stops to keep quiet, without silencing everything else, set them to "⚠️ Problems only": see *"What each container tells you about"*.
+- As in 4.x, you can also write by hand into `.muted_until`, inside the data volume (`/app/config`, or `/app/schedule` if your install still uses the 4.x one), the epoch second the mute ends at, or `0` to unmute: `sh -c 'echo $(( $(date +%s) + 3600 )) > /app/config/.muted_until'`. The bot applies it rounded up to the minute and deletes it, also when it finds it at startup.
+
+</details>
+
+<details>
 <summary>⚙️ Advanced configuration and <code>/settings</code></summary>
 
 Only what the bot needs **before** it can read its own settings is left here: how to reach Telegram and who is allowed to talk to it. The rule is simple: if getting it wrong can lock you out of the bot, it belongs in the docker-compose, because you cannot fix from the chat what stops the chat from working.
@@ -214,8 +234,9 @@ Everything else is configured from the bot itself and stored in `settings.json`,
 |Check for updates| Enabled by default |
 |Check interval| Hours between checks. Decimals are accepted. Default is 4 |
 |Stopped containers| Whether stopped containers are checked for updates too. Enabled by default |
+|Per container| Which containers update on their own and which aren't checked. Also from each one's `/info`. None by default: it tells you about all of them |
 |Notification channel| Channel where container status changes are exclusively published (start, stop, creation and automatic updates). Management still happens in the private chat with the bot or in TELEGRAM_GROUP. The bot verifies it can post there before saving it |
-|Docker hosts| The machines the bot manages. Added, tested, renamed and removed from here. See the remote hosts dropdown |
+|Docker hosts| The machines the bot manages. Added, tested, renamed, moved to another URL and removed from here. See the remote hosts dropdown |
 |Anonymous statistics| Once a day it sends anonymous usage figures. Enabled by default. See [Anonymous statistics](#-anonymous-statistics) |
 
 Changes made from `/settings` apply immediately, without restarting the container.
@@ -329,7 +350,9 @@ The name is optional; leave it out and the bot takes it from the URL. It tests t
 | `❌ I don't know how to connect to...` | The URL does not start with `ssh://`, `tcp://` or `unix://` |
 | `❌ is already registered` | That machine is already added; adding it twice would show its containers duplicated |
 
-After that, pressing the host on that same screen lets you **🔄 Test again**, **✏️ Rename**, **⏸️ Pause host** or **🗑️ Remove host**. The 🟢, 🔴 and ⏸️ in the list tell you at a glance which one answers and which one is paused.
+After that, pressing the host on that same screen lets you **🔄 Test again**, **✏️ Rename**, **🔗 Change URL**, **⏸️ Pause host** or **🗑️ Remove host**. The 🟢, 🔴 and ⏸️ in the list tell you at a glance which one answers and which one is paused.
+
+**🔗 Change URL** is for when the machine gets a new IP or you want to move from `tcp://` to `ssh://`. The host keeps its per-container settings and its schedules, which removing it and adding it again does not. The new URL is tested before it is saved, as when adding a host. If it reaches the same Docker, it is changed right away. If it reaches another Docker, or that cannot be checked because the current URL no longer answers, the bot asks first, since what is kept would apply to the containers on that machine with the same names. If it is another Docker, its update cache is emptied, since it was about another machine.
 
 **⏸️ Pause** is for the machine that is not available right now but that you intend to bring back: it stops being listed, checked and offered in the menus, and its schedules are skipped rather than disabled. Nothing is lost — not the URL, not the name, not the tasks — and the same button resumes it. The local host cannot be paused, because the bot runs on it.
 
@@ -455,12 +478,37 @@ In my case I couldn't get SSH working reliably on Synology, so I went with the *
 </details>
 
 <details>
-<summary>🏷️ Extra functions through labels on other containers</summary>
+<summary>🔄 Containers that update on their own, or aren't checked</summary>
 
-- Adding the label `DCB-Ignore-Check-Updates` to a container, the bot won't check for image updates on this container.
-- Adding the label `DCB-Auto-Update` to a container, it will update automatically without asking.
+By default, when there is a new version the bot tells you. For each container you can choose something else:
+
+- **🔄 Update on its own:** it is updated without asking as soon as the check finds a new version. Everything from the same check goes together, in a single summary message, as if you had ticked them in `/updateall`.
+- **🚫 Don't check:** the check leaves it alone: no notices, and not in `/updateall`.
+
+You choose it from the bot, in two ways, and in both each tap moves it on to the next (tell me → update on its own → don't check):
+
+- In a container's `/info`, with the **🤖 - New version** button.
+- For many at once, in `/settings` → Updates → **📦 Per container**, in the list of containers: 🔔 tells you · 🔄 updates on its own · 🚫 not checked.
+
+It is kept in `settings.json` by host and container name, so it survives the container being recreated or updated. If you delete it with `/delete`, or by deleting its project, its setting goes with it. If it disappears any other way (`/prune` included), the setting is forgotten once it has been missing for 30 days from a host that answers, and the bot tells you. While a host isn't answering or is paused, its settings are left alone; removing a host takes them with it.
+
+The usual labels still work too, `DCB-Auto-Update` and `DCB-Ignore-Check-Updates`. If a container has one of them, the label wins, even when it is `false`: the bot shows it with 🏷️ and it is changed in its compose.
 
 See the full example in the FAQ: *"I've seen that you can add labels…"*.
+
+</details>
+
+<details>
+<summary>🔔 What each container tells you about</summary>
+
+By default the bot tells you everything that happens to a container: when it starts, when it stops, when it fails. For each one you can choose less:
+
+- **⚠️ Problems only:** leaves out starts, stops that were asked for (a `docker stop`, the bot, a task, a backup script) and processes that finish fine, and still tells you about what goes wrong: a crash with a code other than 0, running out of memory, a failing healthcheck and its recovery, and restart loops.
+- **🔕 None:** nothing about that container.
+
+It is chosen in a container's `/info`, with the **🤖 - Notifications** button, or for many at once in `/settings` → **🔔 Notifications per container**. It is kept like the update setting, and can also go in the compose with the `DCB-Notifications=problems` or `DCB-Notifications=none` label, which wins over what is chosen in the bot.
+
+What you ask for from the bot (start, stop, restart) is still confirmed. And it costs nothing: the bot decides with the label that already comes in every Docker event and the settings it keeps in memory, without asking Docker anything else.
 
 </details>
 
@@ -525,9 +573,12 @@ Nor is anything sent when the configuration is not on a volume, because without 
 <details>
 <summary>🛠️ I've seen that you can add labels to control how the bot interacts with certain containers, how do I do that?</summary>
 
-That's right, there are currently two labels you can add to containers to control how the bot interacts with them:
+That's right, there are three labels you can add to containers to control how the bot interacts with them:
 - `DCB-Ignore-Check-Updates`
 - `DCB-Auto-Update`
+- `DCB-Notifications=problems` or `DCB-Notifications=none`, to be told only about problems, or nothing
+
+The same can be chosen from the bot itself, without touching the compose: in each container's `/info`, in `/settings` → Updates → 📦 Per container, and in `/settings` → 🔔 Notifications per container. If a container has the label, the label wins.
 
 To add them to a container, simply edit your `docker-compose.yml` file and include them under the `labels` key.
 Here's an example using **Home Assistant**:
@@ -547,6 +598,7 @@ services:
       - /volume2/temp/ha:/tmp
     labels:
       - "DCB-Auto-Update"
+      - "DCB-Notifications=problems" # only tells you when it fails, not on every start or stop
     restart: unless-stopped
 ```
 </details>
@@ -681,7 +733,7 @@ docker --tlsverify --tlscacert=ca.pem --tlscert=cert.pem --tlskey=key.pem   -H t
 
 The paths are the ones **inside the container**, that is the right-hand side of the volume from step 3. The `id` is yours to pick and its value does not matter as long as it is unique: it only has to be stable, because it is what schedules and the update cache are tied to.
 
-> ❗ **Important:** editing `settings.json` by hand **requires restarting the container**: the bot reads it at start-up and keeps it in memory. After the restart the host shows up in `/settings` → **🖥️ Docker hosts** like any other, and can be tested, renamed and removed from there.
+> ❗ **Important:** editing `settings.json` by hand **requires restarting the container**: the bot reads it at start-up and keeps it in memory. After the restart the host shows up in `/settings` → **🖥️ Docker hosts** like any other, and can be tested, renamed, moved to another URL and removed from there.
 
 </details>
 
@@ -702,7 +754,7 @@ The same as any other container: from `/checkupdate docker-controller-bot` or fr
 
 Under the hood the bot spawns an auxiliary container (`UPDATER-Docker-Controler-Bot`) that pulls the new image, replaces it and brings the bot back up, so the bot is never left without a running process during the update.
 
-If you add the `DCB-Auto-Update` label to its `docker-compose.yml`, it will update itself as soon as a new version is detected.
+If you choose **🔄 Update on its own** in its `/info` (or add the `DCB-Auto-Update` label to its `docker-compose.yml`), it will update itself as soon as a new version is detected.
 </details>
 
 ---
@@ -724,41 +776,52 @@ docker-controller-bot/
     ├── LICENSE
     ├── requirements.txt
     ├── README.md
-    ├── Dockerfile_local
-    ├── docker-compose.debug.yaml
-    ├── docker-controller-bot.py   # entry point: imports and starts
-    ├── core.py                    # the core: DockerManager, monitors, keyboards, UI
-    ├── commands.py                # one `cmd_*` per command
-    ├── callbacks.py               # one `cb_*` per button
-    ├── callback_registry.py       # the `@callback` decorator and the parsing
-    ├── host_registry.py           # the Docker hosts and their client cache
-    ├── store.py                   # settings.json, state and caches
-    ├── migration.py               # start-up migrations (4.x -> 5.0)
-    ├── config.py                  # start-up variables and constants
-    ├── i18n.py                    # locale loading and `get_text`
-    ├── own_container.py           # works out which container it is, unaided
-    ├── docker_update.py
-    ├── docker_compose_manager.py
-    ├── compose_generator.py
-    ├── port_manager.py
-    ├── schedule_manager.py
-    ├── message_queue.py
-    ├── logger.py
-    ├── tests
-    │   ├── run_all.py
-    │   └── ...
-    └── locale
-        ├── en.json
-        ├── es.json
-        ├── de.json
-        ├── ru.json
-        ├── gl.json
-        ├── nl.json
-        ├── cat.json
-        └── it.json
+    ├── Dockerfile
+    ├── docker-compose.yaml
+    ├── dev
+    │   ├── Dockerfile_local
+    │   ├── Dockerfile_debug
+    │   ├── docker-compose.debug.yaml
+    │   └── bench_events.py            # what the event monitor costs, against a real Docker
+    ├── src
+    │   ├── docker-controller-bot.py   # entry point: imports and starts
+    │   ├── core.py                    # the core: DockerManager, monitors, keyboards, UI
+    │   ├── commands.py                # one `cmd_*` per command
+    │   ├── callbacks.py               # one `cb_*` per button
+    │   ├── callback_registry.py       # the `@callback` decorator and the parsing
+    │   ├── host_registry.py           # the Docker hosts and their client cache
+    │   ├── store.py                   # settings.json, state and caches
+    │   ├── migration.py               # start-up migrations (4.x -> 5.0)
+    │   ├── config.py                  # start-up variables and constants
+    │   ├── i18n.py                    # locale loading and `get_text`
+    │   ├── own_container.py           # works out which container it is, unaided
+    │   ├── unraid.py                  # tells Unraid what the bot updated
+    │   ├── dcb_mute.py                # `dcb-mute`: mute from a script
+    │   ├── docker_update.py
+    │   ├── docker_compose_manager.py
+    │   ├── compose_generator.py
+    │   ├── container_listing.py
+    │   ├── formatting.py
+    │   ├── port_manager.py
+    │   ├── schedule_manager.py
+    │   ├── schedules.py
+    │   ├── message_queue.py
+    │   ├── logger.py
+    │   └── locale
+    │       ├── en.json
+    │       ├── es.json
+    │       ├── de.json
+    │       ├── ru.json
+    │       ├── gl.json
+    │       ├── nl.json
+    │       ├── cat.json
+    │       └── it.json
+    └── tests
+        ├── run_all.py
+        └── ...
 ```
 
-To bring it up, run in that path: `docker compose -f docker-compose.debug.yaml up  -d --build --force-recreate`
+To bring it up, run in that path: `docker compose -f dev/docker-compose.debug.yaml up  -d --build --force-recreate`
 To stop and remove it: `docker compose down --rmi`
 
 To try out new changes, just save. Changes are reloaded on the fly.

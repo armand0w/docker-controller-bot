@@ -6,6 +6,7 @@ every test runs against that instance. They share it deliberately: the module
 is global state by design, and loading it is the slow part.
 """
 
+import html
 import io
 import json
 import os
@@ -203,6 +204,7 @@ def test_the_update_settings_live_on_their_own_screen():
 		"settingsToggle|check_updates",
 		"settingsAskInterval",
 		"settingsToggle|check_update_stopped_containers",
+		"settingsContainers",
 		"settings",
 		"cerrar",
 	]
@@ -277,21 +279,25 @@ def test_an_interval_that_is_not_a_number_falls_back_everywhere():
 def test_the_channel_is_verified_before_being_saved():
 	"""
 	Saving an id the bot cannot post to would send every notification into the
-	void, with nothing in the interface to explain why.
+	void, with nothing in the interface to explain why. Being able to see the
+	chat was not enough: a public channel can be seen by anyone, and an admin
+	of it without the right to post can see it too. So a message is posted.
 	"""
 	store.set("bot.notification_channel", "")
-	original_send, original_chat = dcb.send_message, dcb.bot.get_chat
+	original_send, original_post = dcb.send_message, dcb.bot.send_message
 	dcb.send_message = lambda *args, **kwargs: None
+	posted = []
 	try:
-		dcb.bot.get_chat = lambda *args, **kwargs: (_ for _ in ()).throw(Exception("chat not found"))
+		dcb.bot.send_message = lambda *args, **kwargs: (_ for _ in ()).throw(Exception("not enough rights"))
 		assert dcb.apply_settings_text_value("notification_channel", "-100999") is None
 		assert store.get("bot.notification_channel") == ""
 
-		dcb.bot.get_chat = lambda *args, **kwargs: MagicMock()
+		dcb.bot.send_message = lambda chat_id, text, **kwargs: posted.append((chat_id, text)) or MagicMock()
 		assert dcb.apply_settings_text_value("notification_channel", "-100999") is not None
 		assert store.get("bot.notification_channel") == "-100999"
+		assert posted == [("-100999", dcb.get_text("settings_channel_test"))], posted
 	finally:
-		dcb.send_message, dcb.bot.get_chat = original_send, original_chat
+		dcb.send_message, dcb.bot.send_message = original_send, original_post
 	store.set("bot.notification_channel", "")
 
 
@@ -334,7 +340,7 @@ def test_answering_the_mute_prompt_goes_through_the_registry():
 	reached it: the static check did.
 	"""
 	assert "/mute" in dcb.COMMAND_ACTIONS
-	source = io.open(os.path.join(harness.REPO, "core.py"), encoding="utf-8").read()
+	source = io.open(os.path.join(harness.SRC, "core.py"), encoding="utf-8").read()
 	assert "cmd_mute(" not in source, "el núcleo no debe llamar a un comando por su nombre"
 
 
@@ -358,7 +364,7 @@ def test_mute_asks_for_its_argument_when_pressed_as_a_button():
 
 def _registered_commands():
 	"""The command names the Telegram handler is subscribed to."""
-	path = os.path.join(harness.REPO, "core.py")
+	path = os.path.join(harness.SRC, "core.py")
 	line = [l for l in io.open(path, encoding="utf-8")
 			if l.startswith("@bot.message_handler(commands=")][0]
 	return set(re.findall(r'"([a-z]+)"', line))
@@ -434,7 +440,7 @@ def test_no_locale_carries_keys_nobody_reads():
 # short as the code allows.
 DYNAMIC_TEXT_PREFIXES = (
 	"start_cat_", "start_cmd_", "schedule_prune_", "schedule_action_",
-	"confirm_prune_",
+	"schedule_label_", "schedule_edit_", "confirm_prune_",
 )
 
 
@@ -841,6 +847,8 @@ def test_the_update_daemon_checks_the_fleet_and_then_waits():
 	passes = []
 	original = (dcb.DockerUpdateMonitor._check_fleet, dcb.wait_for_next_update_check)
 	was_checking = store.get("bot.check_updates")
+	# The pass marks the first check done; left so, later tests would inherit it.
+	was_done = store.state_get("update_check_done")
 
 	def wait():
 		raise Waited()
@@ -866,6 +874,7 @@ def test_the_update_daemon_checks_the_fleet_and_then_waits():
 	finally:
 		dcb.DockerUpdateMonitor._check_fleet, dcb.wait_for_next_update_check = original
 		store.set("bot.check_updates", was_checking)
+		store.state_set("update_check_done", was_done)
 
 
 def test_a_pass_that_fails_does_not_end_the_update_checks():
@@ -882,6 +891,8 @@ def test_a_pass_that_fails_does_not_end_the_update_checks():
 	waits = []
 	original = (dcb.DockerUpdateMonitor._check_fleet, dcb.wait_for_next_update_check)
 	was_checking = store.get("bot.check_updates")
+	# The pass marks the first check done; left so, later tests would inherit it.
+	was_done = store.state_get("update_check_done")
 
 	def failing_pass(self, cold_cache):
 		passes.append(cold_cache)
@@ -904,6 +915,7 @@ def test_a_pass_that_fails_does_not_end_the_update_checks():
 	finally:
 		dcb.DockerUpdateMonitor._check_fleet, dcb.wait_for_next_update_check = original
 		store.set("bot.check_updates", was_checking)
+		store.state_set("update_check_done", was_done)
 
 
 def test_a_failed_pull_keeps_what_was_known_about_the_update():
@@ -916,7 +928,8 @@ def test_a_failed_pull_keeps_what_was_known_about_the_update():
 	plex = _container("plex", "running", image="plex:latest")
 	plex.image.id = "sha256:old"
 	owner = MagicMock()
-	owner.client.images.pull.side_effect = Exception("429 Too Many Requests")
+	# Pulled through the API, so an error inside the stream is seen too.
+	owner.client.api.pull.side_effect = Exception("429 Too Many Requests")
 	try:
 		dcb.save_container_update_status("plex:latest", "plex", True, "h_local")
 		found, has_new = dcb.DockerUpdateMonitor()._check_host(HOST_FIXTURE[0], owner, False, [plex])
@@ -936,15 +949,16 @@ def test_one_pull_per_image_and_pass():
 		service.image.id = "sha256:same"
 		services.append(service)
 	owner = MagicMock()
-	owner.client.images.pull.return_value = MagicMock(id="sha256:same")
+	owner.client.api.pull.return_value = []
+	owner.client.images.get.return_value = MagicMock(id="sha256:same")
 	try:
 		dcb.DockerUpdateMonitor()._check_host(HOST_FIXTURE[0], owner, False, services)
-		assert owner.client.images.pull.call_count == 1, owner.client.images.pull.call_args_list
+		assert owner.client.api.pull.call_count == 1, owner.client.api.pull.call_args_list
 		# A failure is remembered for the rest of the pass too.
-		owner.client.images.pull.reset_mock()
-		owner.client.images.pull.side_effect = Exception("429 Too Many Requests")
+		owner.client.api.pull.reset_mock()
+		owner.client.api.pull.side_effect = Exception("429 Too Many Requests")
 		dcb.DockerUpdateMonitor()._check_host(HOST_FIXTURE[0], owner, False, services)
-		assert owner.client.images.pull.call_count == 1, owner.client.images.pull.call_args_list
+		assert owner.client.api.pull.call_count == 1, owner.client.api.pull.call_args_list
 	finally:
 		for name in ("web", "worker", "beat"):
 			dcb.save_container_update_status("app:latest", name, None, "h_local")
@@ -955,33 +969,42 @@ def test_a_bot_labelled_for_auto_update_waits_for_the_end_of_the_pass():
 	"""
 	Updating the bot recreates it. Done where it was found, the hosts after
 	its own were never checked in that pass.
+
+	The rest of what updates on its own goes before the message with buttons,
+	in one batch, and the bot after it: last of all, since from there it is
+	replaced by the new one.
 	"""
 	_with_hosts(HOST_FIXTURE, unreachable=())
 	me = _container("docker-controller-bot", "running", image="dcb:latest")
 	me.id = "1" * 64
 	me.image.id = "sha256:old"
 	me.labels = {dcb.LABEL_AUTO_UPDATE: ""}
+	sonarr = _container("sonarr", "running", image="sonarr:latest")
+	sonarr.image.id = "sha256:old"
+	sonarr.labels = {dcb.LABEL_AUTO_UPDATE: ""}
 	plex = _container("plex", "running", image="plex:latest")
 	plex.image.id = "sha256:old"
 	events = []
 	undo = _pretend_to_be(me)
-	listed = {"h_local": [me], "h_nas": [plex]}
-	original = (dcb.DockerManager.list_containers, dcb.DockerUpdateMonitor._auto_update,
-				dcb.DockerUpdateMonitor._announce, dcb.is_own_container)
+	listed = {"h_local": [me], "h_nas": [plex, sonarr]}
+	original = (dcb.DockerManager.list_containers, dcb.update_containers, dcb.find_live_container,
+				dcb.runs_latest_image, dcb.DockerUpdateMonitor._announce, dcb.is_own_container)
 	dcb.DockerManager.list_containers = lambda self, comando="": listed[self.host_id]
-	dcb.DockerUpdateMonitor._auto_update = lambda self, host_id, ref, name: events.append(("auto", name))
+	dcb.update_containers = lambda targets, send=None, **kw: events.append(("batch", [n for _, n in targets]))
+	dcb.find_live_container = lambda ref, name: (dcb.manager(dcb.ref_host(ref)), {c.name: c for c in (me, plex, sonarr)}[name])
+	dcb.runs_latest_image = lambda ref, name: False
 	dcb.DockerUpdateMonitor._announce = lambda self, found, new: events.append(("announce", [n for _, n in found]))
 	dcb.is_own_container = lambda host_id=None, container_id=None, container_name=None: container_name == me.name
 	try:
 		for owner in dcb.managers():
-			owner.client.images.pull = lambda image: (events.append(("pull", image)), MagicMock(id="sha256:new"))[1]
+			owner.client.api.pull = lambda repo, tag=None, **kwargs: (events.append(("pull", f"{repo}:{tag}")), [])[1]
+			owner.client.images.get = lambda reference: MagicMock(id="sha256:new")
 		dcb.DockerUpdateMonitor()._check_fleet(cold_cache=False)
-		assert events[-1] == ("auto", me.name), events
-		assert ("pull", "plex:latest") in events[:-1], events
-		assert ("announce", ["plex"]) in events, events
+		assert events[-3:] == [("batch", ["sonarr"]), ("announce", ["plex"]), ("batch", [me.name])], events
+		assert ("pull", "plex:latest") in events[:-3], events
 	finally:
-		(dcb.DockerManager.list_containers, dcb.DockerUpdateMonitor._auto_update,
-			dcb.DockerUpdateMonitor._announce, dcb.is_own_container) = original
+		(dcb.DockerManager.list_containers, dcb.update_containers, dcb.find_live_container,
+			dcb.runs_latest_image, dcb.DockerUpdateMonitor._announce, dcb.is_own_container) = original
 		for name, image in ((me.name, "dcb:latest"), ("plex", "plex:latest")):
 			dcb.save_container_update_status(image, name, None, "h_local")
 			dcb.save_container_update_status(image, name, None, "h_nas")
@@ -1239,40 +1262,18 @@ def test_the_same_question_names_no_host_when_there_is_only_one():
 _VALUE_FOR = {
 	"pickHost": "host", "portsHost": "host", "pruneHost": "host", "prune": "host",
 	"settingsHost": "host", "settingsHostRename": "host", "settingsHostRemove": "host",
-	"scheduleSelectHost": "host", "generatePort": "host", "checkPort": "host",
+	"generatePort": "host", "checkPort": "host",
 	# Deliberately a host that is not registered: this one actually removes.
 	"settingsHostRemoveConfirm": "h_nonexistent",
 	"settingsSetColumns": "2", "settingsSetLanguage": "ES",
 	"startCategory": "system", "startCommand": "list",
-	"scheduleEditValue": "0 0 * * *",
 }
 
 _ARG_FOR = {
-	"containerName": "nginx", "action": "prune Images", "scheduleHash": "deadbeef",
+	"containerName": "nginx", "action": "prune Images",
 	"field": "cron", "scheduleId": "1", "commandId": "cmd1", "tag": "latest",
-	"originalMessageId": "42", "containerIdx": "0", "pruneType": "images",
+	"originalMessageId": "42", "containerIdx": "0",
 }
-
-
-def test_the_schedule_list_is_never_handed_out_live():
-	"""
-	get_all_schedules used to return the manager's own list. The executor
-	iterates it while a button press may be adding or deleting, and a caller
-	could change the manager's state just by appending to what it thought was
-	its own copy.
-	"""
-	manager = dcb.schedule_manager
-	for existing in list(manager.get_all_schedules()):
-		manager.delete_schedule(existing["name"])
-	manager.add_schedule(name="una", cron="@daily", action="restart", container="nginx")
-	try:
-		mine = manager.get_all_schedules()
-		assert mine is not manager.get_all_schedules(), "devuelve la lista interna"
-		mine.append({"name": "inyectada"})
-		assert [s["name"] for s in manager.get_all_schedules()] == ["una"], (
-			"un append del llamante ha cambiado el estado del manager")
-	finally:
-		manager.delete_schedule("una")
 
 
 def test_schedules_are_written_atomically():
@@ -1284,7 +1285,7 @@ def test_schedules_are_written_atomically():
 	"""
 	import ast
 
-	source = io.open(os.path.join(harness.REPO, "schedule_manager.py"),
+	source = io.open(os.path.join(harness.SRC, "schedule_manager.py"),
 						encoding="utf-8").read()
 	tree = ast.parse(source)
 	writers = [n for n in ast.walk(tree)
@@ -1297,57 +1298,6 @@ def test_schedules_are_written_atomically():
 									and isinstance(statement.value, ast.Constant)))
 		assert "store.write_document" in code, f"{writer.name} no escribe por store:\n{code}"
 		assert "open(" not in code, f"{writer.name} escribe sobre el fichero real:\n{code}"
-
-
-def test_concurrent_edits_to_the_schedules_do_not_lose_any():
-	"""
-	The executor thread and telebot's workers touch this at the same time, and
-	the lock only covered the file, not the cache or the id counter.
-	"""
-	import threading
-
-	manager = dcb.schedule_manager
-	for existing in list(manager.get_all_schedules()):
-		manager.delete_schedule(existing["name"])
-	start = threading.Barrier(8)
-
-	def add(index):
-		start.wait()
-		manager.add_schedule(name=f"t{index}", cron="@daily",
-							action="restart", container="nginx")
-
-	workers = [threading.Thread(target=add, args=(i,), daemon=True) for i in range(8)]
-	for worker in workers:
-		worker.start()
-	for worker in workers:
-		worker.join(10)
-	try:
-		stored = manager.get_all_schedules()
-		assert len(stored) == 8, [s["name"] for s in stored]
-		identifiers = [s["id"] for s in stored]
-		assert len(set(identifiers)) == 8, f"ids repetidos: {sorted(identifiers)}"
-	finally:
-		for existing in list(manager.get_all_schedules()):
-			manager.delete_schedule(existing["name"])
-
-
-def test_the_schedule_flow_state_lives_in_the_volume():
-	"""
-	It used to be written to a relative `./cache/`, which under the image's
-	WORKDIR meant inside the container instead of the mapped volume: nothing
-	swept it, and its errors went to stdout with print() rather than the log.
-	"""
-	import glob
-
-	dcb.save_schedule_state(4242, {"step": "ask_name", "name": None})
-	try:
-		assert dcb.load_schedule_state(4242) == {"step": "ask_name", "name": None}
-		found = glob.glob(os.path.join(store.root(), "**", "*schedule_state_4242*"),
-							recursive=True)
-		assert found, "el estado no está dentro del volumen de almacenamiento"
-	finally:
-		dcb.clear_schedule_state(4242)
-	assert dcb.load_schedule_state(4242) is None
 
 
 def test_an_absurd_mute_does_not_silence_the_bot_for_good():
@@ -1629,7 +1579,7 @@ def _press_every_button_through_the_dispatcher():
 	project_hash = dcb.register_project_hash("media", local)
 
 	values = dict(_VALUE_FOR, generatePort="host", checkPort="host")
-	arguments = dict(_ARG_FOR, containerName=project_hash, scheduleHash=project_hash)
+	arguments = dict(_ARG_FOR, containerName=project_hash)
 
 	ran, broken = set(), []
 	specs = callback_registry.specs()
@@ -1658,8 +1608,15 @@ def _press_every_button_through_the_dispatcher():
 			assert len(data.encode()) <= 64, f"{name}: {len(data.encode())} bytes de callback_data"
 			press = MagicMock()
 			press.data, press.id = data, "q1"
-			press.message.id, press.message.chat.id = 2, 1
+			# In the admin's private chat: buttons are only taken where commands are.
+			press.message.id, press.message.chat.id, press.message.chat.type = 2, admin, "private"
+			press.message.date, press.message.edit_date = int(time.time()), None
 			press.from_user.id, press.from_user.username = admin, "test"
+			# The names saved as the menus save them, again for every press: a
+			# press that closes its message forgets them. Without them only the
+			# five characters of the ID are left, and a stub container has no
+			# creation date to tell it from one created after the message.
+			dcb.save_container_refs(admin, 2, [(f"{local}:abc12", "nginx")])
 			try:
 				dcb.button_controller(press)
 			except Exception as e:
@@ -1667,6 +1624,7 @@ def _press_every_button_through_the_dispatcher():
 	finally:
 		for name, handler in original.items():
 			specs[name].handler = handler
+		dcb.clear_container_cache(admin, 2)
 	return ran, broken
 
 
@@ -2329,7 +2287,7 @@ def _quiet_bot():
 	"""Silences everything that leaves the process, and returns the undo."""
 	sent = MagicMock(message_id=1)
 	sent.chat.id = 1
-	names = ("send_message", "edit_message_text", "send_document",
+	names = ("send_message", "edit_message_text", "edit_message_text_sync", "send_document",
 				"send_message_to_notification_channel")
 	silent = ("delete_message", "edit_message_reply_markup",
 				"edit_message_reply_markup_sync", "answer_callback_quietly")
@@ -2457,7 +2415,7 @@ def test_info_reads_the_update_cache_of_its_own_host():
 		for host_id, expected in (("h_nas", True), ("h_local", False)):
 			owner = dcb.manager(host_id)
 			owner.client.containers.get = lambda _id, _c=nginx: _c
-			_text, possible_update, _can_start = owner.get_info(container_id="abc12", container_name="nginx")
+			_text, possible_update, _can_start, _updates = owner.get_info(container_id="abc12", container_name="nginx")
 			assert possible_update is expected, (host_id, possible_update)
 	finally:
 		dcb.DockerManager.list_containers = original
@@ -2518,11 +2476,24 @@ def test_the_ports_screen_asks_about_the_host_you_are_looking_at():
 	fake = {"h_local": [], "h_nas": [occupied]}
 	original = dcb.DockerManager.list_containers
 	dcb.DockerManager.list_containers = lambda self, comando="", inspect=False: fake[self.host_id]
+	# The bind the bot does for its own machine, decided here: depending on
+	# what happens to listen on the machine running the tests made this fail
+	# wherever 8080 was in use.
+	bind_free = {"value": True}
+	dcb.port_manager._is_port_available = lambda port: bind_free["value"]
 	try:
 		taken_on_nas, _ = dcb.check_specific_port(8080, "h_nas")
 		free_locally, _ = dcb.check_specific_port(8080, "h_local")
 		assert taken_on_nas is False, "8080 está ocupado en el nas"
 		assert free_locally is True, "y libre en el host local"
+
+		# Something of the bot's own machine listening on a port says nothing
+		# about another one: for the NAS, only what its containers publish.
+		bind_free["value"] = False
+		free_on_nas, _ = dcb.check_specific_port(9090, "h_nas")
+		taken_locally, _ = dcb.check_specific_port(9090, "h_local")
+		assert free_on_nas is True, "nada publica el 9090 en el nas"
+		assert taken_locally is False, "pero aquí algo lo usa"
 
 		# And the buttons carry the host, or the answer above cannot be asked.
 		captured = {}
@@ -2538,6 +2509,7 @@ def test_the_ports_screen_asks_about_the_host_you_are_looking_at():
 		assert "checkPort|h_nas" in callbacks_seen, callbacks_seen
 	finally:
 		dcb.DockerManager.list_containers = original
+		del dcb.port_manager._is_port_available
 		_restore_hosts()
 
 
@@ -3007,24 +2979,6 @@ def test_every_command_with_a_picker_can_disambiguate():
 		assert callback_registry.get(spec["container_callback"]) is not None, spec
 
 
-def test_a_scheduled_task_resolves_on_its_own_host():
-	"""
-	A task names a container, and acting on a same-named container elsewhere
-	would be silent and, for stop or exec, destructive.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	plex = _container("plex", "running")
-	original = dcb.DockerManager.container_named
-	dcb.DockerManager.container_named = lambda self, name: plex if name == "plex" else None
-	try:
-		ref = dcb.schedule_container_ref("h_nas", "plex")
-		assert dcb.ref_host(ref) == "h_nas", ref
-		assert dcb.schedule_container_ref("h_nas", "noexiste") is None
-	finally:
-		dcb.DockerManager.container_named = original
-		_restore_hosts()
-
-
 def test_a_host_screen_asks_only_for_the_host():
 	"""
 	It used to borrow the action's own prompt, so /prune asked for an object
@@ -3211,7 +3165,7 @@ def test_two_listings_at_once_both_see_a_healthy_host():
 
 def test_ssh_hosts_are_bounded_in_every_image():
 	"""docker-py reads the ssh pipe with no timeout; ssh's own keepalive is the only bound."""
-	for name in ("Dockerfile", "Dockerfile_debug", "Dockerfile_local"):
+	for name in ("Dockerfile", "dev/Dockerfile_debug", "dev/Dockerfile_local"):
 		with open(os.path.join(harness.REPO, name), encoding="utf-8") as f:
 			text = f.read()
 		for option in ("BatchMode yes", "ConnectTimeout", "ServerAliveInterval", "ServerAliveCountMax"):
@@ -3256,53 +3210,6 @@ def test_a_project_on_an_unreachable_host_gives_no_names():
 	try:
 		assert dcb.get_project_container_names("media", "h_nas") == []
 	finally:
-		_restore_hosts()
-
-
-def test_scheduling_offers_containers_from_every_host():
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	original = dcb.DockerManager.list_containers
-	dcb.DockerManager.list_containers = lambda self, comando="": (
-		[_container("plex", "running")] if self.host_id == "h_nas" else [_container("nginx", "running")])
-	try:
-		available = dcb._get_available_containers()
-		assert {entry["id"] for entry, _ in available} == {"h_local", "h_nas"}
-		assert {container.name for _, container in available} == {"nginx", "plex"}
-	finally:
-		dcb.DockerManager.list_containers = original
-		_restore_hosts()
-
-
-def test_editing_a_tasks_container_offers_every_host_and_moves_the_host_too():
-	"""
-	The edit screen still read container.name off what is now (host, container)
-	pairs, so choosing "Container" raised. And the value it saved was the name
-	alone: the task kept its old host and pointed at a namesake, or at nothing.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	original_list = dcb.DockerManager.list_containers
-	dcb.DockerManager.list_containers = lambda self, comando="": (
-		[_container("plex", "running")] if self.host_id == "h_nas" else [_container("nginx", "running")])
-	undo = _quiet_bot()
-	manager = dcb.schedule_manager
-	manager.add_schedule(name="editame", cron="@daily", action="restart", container="nginx", host="h_local")
-	try:
-		task = next(s for s in manager.get_all_schedules() if s["name"] == "editame")
-		base = {"call": MagicMock(id="q1"), "chatId": 1, "messageId": 2, "userId": 77,
-				"comando": "x", "multiAction": None, "hostId": "h_local", "containerId": None}
-		callbacks.cb_scheduleEditField(callback_registry.Context(
-			**base, field="container", scheduleId=str(task["id"])))
-		state = dcb.load_schedule_state(77)
-		idx = next(k.split("_")[1] for k, v in state.items() if k.startswith("container_") and v == "plex")
-		assert state[f"container_host_{idx}"] == "h_nas", state
-		callbacks.cb_scheduleEditValue(callback_registry.Context(
-			**base, field="container", scheduleId=str(task["id"]), value=idx))
-		edited = manager.get_schedule_by_id(task["id"])
-		assert (edited["container"], edited["host"]) == ("plex", "h_nas"), edited
-	finally:
-		manager.delete_schedule("editame")
-		undo()
-		dcb.DockerManager.list_containers = original_list
 		_restore_hosts()
 
 
@@ -3353,19 +3260,6 @@ def test_a_message_cached_before_the_host_was_stored_still_says_it():
 		dcb.clear_container_cache(1, 2)
 
 
-def test_the_bot_is_never_offered_to_a_scheduled_task():
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	original = dcb.DockerManager.list_containers
-	dcb.DockerManager.list_containers = lambda self, comando="": [
-		_container(dcb.CONTAINER_NAME, "running"), _container("nginx", "running")]
-	try:
-		names = {container.name for _, container in dcb._get_available_containers()}
-		assert names == {"nginx"}, names
-	finally:
-		dcb.DockerManager.list_containers = original
-		_restore_hosts()
-
-
 def _assert_telegram_html(text, where=""):
 	"""
 	Fails unless Telegram would parse `text`: only the tags it knows, balanced.
@@ -3396,100 +3290,6 @@ def _assert_telegram_html(text, where=""):
 	import re
 	stray = re.sub(r"</?(?:%s)(?:\s[^>]*)?>" % "|".join(sorted(allowed, key=len, reverse=True)), "", text)
 	assert "<" not in stray, f"{where}: «<» sin escapar en {text!r}"
-
-
-def test_what_the_user_typed_in_a_schedule_never_breaks_its_screens():
-	"""
-	A scheduled `mysql < dump.sql`, or a task called "copia <diaria>", went into
-	the HTML raw: Telegram rejected the message, and /schedule failed to open
-	every time from then on.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	task = {"id": 7, "name": "copia <diaria> & co", "cron": "@daily", "action": "exec",
-			"container": "db<x>", "command": "mysql < dump.sql > out", "show_output": True,
-			"host": "h_local", "enabled": True}
-	sent = []
-	original = (dcb.send_message, dcb.schedule_manager.get_all_schedules,
-				dcb.schedule_manager.get_schedule, dcb.schedule_manager.get_schedule_by_id,
-				dcb.schedule_manager.update_schedule, dcb.schedule_manager.delete_schedule)
-	dcb.send_message = lambda **kwargs: sent.append(kwargs.get("message", "")) or MagicMock(message_id=1)
-	dcb.schedule_manager.get_all_schedules = lambda: [task]
-	dcb.schedule_manager.get_schedule = lambda _name: task
-	dcb.schedule_manager.get_schedule_by_id = lambda _id: task
-	dcb.schedule_manager.update_schedule = lambda *a, **k: True
-	try:
-		texts = {"resumen": dcb._build_schedule_summary(task)}
-		dcb.show_schedule_menu(1, 1)
-		dcb.show_schedule_edit_options(1, task["name"])
-		base = {"call": MagicMock(id="q"), "chatId": 1, "messageId": 2, "userId": 1,
-				"comando": "x", "multiAction": None, "hostId": "h_local", "containerId": None}
-		for field in ("name", "command"):
-			callbacks.cb_scheduleEditField(callback_registry.Context(**base, field=field, scheduleId="7"))
-		callbacks.cb_scheduleEditValue(callback_registry.Context(**base, field="show_output", scheduleId="7", value="yes"))
-		for i, text in enumerate(sent):
-			texts[f"mensaje {i}"] = text
-		for where, text in texts.items():
-			_assert_telegram_html(text, where)
-		joined = "\n".join(texts.values())
-		assert "&lt;diaria&gt;" in joined and "mysql &lt; dump.sql" in joined, joined
-	finally:
-		(dcb.send_message, dcb.schedule_manager.get_all_schedules, dcb.schedule_manager.get_schedule,
-			dcb.schedule_manager.get_schedule_by_id, dcb.schedule_manager.update_schedule,
-			dcb.schedule_manager.delete_schedule) = original
-		_restore_hosts()
-
-
-def test_the_schedule_wizard_survives_whatever_is_typed_into_it():
-	"""
-	Every step of creating a task, fed what a user might type: a name with
-	`<`, `&` and quotes, a cron that is not one, minutes that are not a
-	number, a command with redirections. Each screen it answers with has to
-	be one Telegram accepts, or the wizard stops halfway with no message.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	nasty = 'copia <diaria> & "co"'
-	sent = []
-	original = (dcb.send_message, dcb.save_schedule_state, dcb.schedule_manager.get_schedule,
-				dcb.schedule_manager.add_schedule, dcb.delete_message)
-	dcb.send_message = lambda **kwargs: sent.append(kwargs.get("message", "")) or MagicMock(message_id=1)
-	dcb.save_schedule_state = lambda *a, **k: None
-	dcb.delete_message = lambda *a, **k: None
-	dcb.schedule_manager.get_schedule = lambda name: None
-	dcb.schedule_manager.add_schedule = lambda *a, **k: True
-	try:
-		steps = [
-			({"step": "ask_name"}, nasty),
-			({"step": "ask_cron", "name": nasty}, "<no es cron>"),
-			({"step": "ask_cron", "name": nasty}, "0 3 * * *"),
-			({"step": "ask_minutes", "name": nasty, "cron": "@daily", "action": "mute"}, "<diez>"),
-			({"step": "ask_minutes", "name": nasty, "cron": "@daily", "action": "mute"}, "-5"),
-			({"step": "ask_minutes", "name": nasty, "cron": "@daily", "action": "mute"}, "10"),
-			({"step": "ask_command", "name": nasty, "cron": "@daily", "action": "exec",
-				"container": "db<1>", "host": "h_local"}, "mysql < dump.sql > out && echo ok"),
-		]
-		for state, typed in steps:
-			before = len(sent)
-			dcb.handle_schedule_flow(1, typed, dict(state), chat_id=1)
-			assert len(sent) > before, f"{state['step']} con {typed!r} no contestó nada"
-		for i, text in enumerate(sent):
-			_assert_telegram_html(text, f"mensaje {i}")
-	finally:
-		(dcb.send_message, dcb.save_schedule_state, dcb.schedule_manager.get_schedule,
-			dcb.schedule_manager.add_schedule, dcb.delete_message) = original
-		_restore_hosts()
-
-
-def test_a_cron_that_never_fires_is_not_accepted():
-	"""
-	`0 0 30 2 *` parses — and fires on the 30th of February. It was saved,
-	never ran, and nothing said why.
-	"""
-	for never in ("0 0 30 2 *", "0 0 31 4 *", "0 0 31 6 *"):
-		assert not dcb.is_valid_cron(never), never
-	for fine in ("0 0 29 2 *", "0 0 L * *", "*/5 * * * *", "@daily", "@reboot", "0 0 * * 1#2"):
-		assert dcb.is_valid_cron(fine), fine
-	for broken in ("", "60 * * * *", "* * * *", "* * * * * *", "*/0 * * * *", "<b>", "@nunca"):
-		assert not dcb.is_valid_cron(broken), broken
 
 
 def test_the_registry_of_an_image_is_read_the_way_docker_reads_it():
@@ -3560,7 +3360,7 @@ def _info(**overrides):
 			"since": "2026-10-02 09:14", "since_seconds": 3 * 86400 + 60, "version": "1.43.4.10903-e5521bd8c-ls326",
 			"image_created": "2026-09-28", "image_size": "405.1MiB", "image_digest": "7a94fbb0a7e8",
 			"release_notes_url": None, "registry_url": None, "registry_name": None,
-			"has_update": False, "update_versions": (None, None), "auto_update": False, "ignore_checks": False,
+			"has_update": False, "update_versions": (None, None), "update_mode": None, "update_mode_label": None,
 			"schedules": [], "networks": [], "shared_by": [], "ports": [], "mounts": []}
 	info.update(overrides)
 	return info
@@ -3736,47 +3536,6 @@ def test_registry_tags_are_read_to_the_last_page():
 		dcb.requests.Session = original
 
 
-def test_the_three_renderers_put_the_host_in_the_same_place():
-	"""
-	The creation summary, the listing and the edit screen each build their own
-	text. With the host in a different position in each, the same task read
-	three different ways round.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	task = {"id": 1, "name": "Limpieza", "cron": "@hourly", "action": "prune",
-			"prune_type": "images", "show_output": False, "host": "h_nas",
-			"enabled": True}
-	captured = {}
-	original = dcb.send_message
-	dcb.send_message = lambda **kwargs: captured.update(kwargs)
-	original_all = dcb.schedule_manager.get_all_schedules
-	dcb.schedule_manager.get_all_schedules = lambda: [task]
-	original_get = dcb.schedule_manager.get_schedule
-	dcb.schedule_manager.get_schedule = lambda _name: task
-	try:
-		texts = {}
-		texts["summary"] = dcb._build_schedule_summary(task)
-		dcb.show_schedule_menu(1, 1)
-		texts["listing"] = captured["message"]
-		captured.clear()
-		dcb.show_schedule_edit_options(1, "Limpieza")
-		texts["edit"] = captured.get("message", "")
-
-		prune_label = dcb.get_text("schedule_label_prune_type")
-		host_label_text = dcb.get_text("schedule_label_host")
-		output_label = dcb.get_text("schedule_label_show_output")
-		for where, text in texts.items():
-			assert host_label_text in text, (where, text)
-			positions = [text.index(prune_label), text.index(host_label_text),
-						text.index(output_label)]
-			assert positions == sorted(positions), (where, text)
-	finally:
-		dcb.send_message = original
-		dcb.schedule_manager.get_all_schedules = original_all
-		dcb.schedule_manager.get_schedule = original_get
-		_restore_hosts()
-
-
 # ---------------------------------------------------------------------------
 # Pausar un host
 
@@ -3893,334 +3652,6 @@ def test_the_local_host_cannot_be_paused():
 		_restore_hosts()
 
 
-def test_a_schedule_on_a_paused_host_is_skipped_not_disabled():
-	"""
-	The executor disables a task whose action fails, and an unreachable host
-	fails every one of them: a machine down for a week used to come back with
-	its schedules switched off one by one.
-
-	A paused host is the case where that is plainly wrong — it is coming back
-	on purpose — so its tasks are skipped and left enabled.
-	"""
-	host_registry = _paused_fixture()
-	task = {"id": 1, "name": "Reinicio nocturno", "cron": "@daily", "action": "restart",
-			"container": "plex", "host": "h_nas", "enabled": True}
-	disabled = []
-	messages = []
-	original = (dcb.schedule_manager.update_schedule, dcb.send_message)
-	dcb.schedule_manager.update_schedule = lambda name, **kwargs: disabled.append((name, kwargs))
-	dcb.send_message = lambda **kwargs: messages.append(kwargs) or None
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		assert monitor._execute_schedule_action(task) is True
-		assert disabled == [], f"la tarea se desactivó: {disabled}"
-		assert messages == [], f"la pausa no es algo que anunciar en cada vuelta: {messages}"
-	finally:
-		(dcb.schedule_manager.update_schedule, dcb.send_message) = original
-		_restore_hosts()
-
-def test_a_scheduled_prune_does_not_hold_up_the_scheduler():
-	"""
-	The loop runs every task in line, and a prune can now take minutes. One
-	that outlasted the catch-up window made the loop skip the minutes after it,
-	and their tasks with them. It goes to a worker of its own, which still runs
-	them one at a time and in order: a containers prune frees images for the
-	images one due with it.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	release = threading.Event()
-	ran, sent = [], []
-	owner = MagicMock()
-
-	def pruning(kind):
-		def prune():
-			release.wait(5)
-			ran.append(kind)
-			return (f"ok {kind}", None)
-		return prune
-
-	owner.prune_containers.side_effect = pruning("containers")
-	owner.prune_images.side_effect = pruning("images")
-	original = (dcb.manager, dcb.send_message)
-	dcb.manager = lambda host_id=None: owner
-	dcb.send_message = lambda **kw: sent.append(kw.get("message"))
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		started = time.time()
-		for kind in ("containers", "images"):
-			task = {"id": 1, "name": f"limpia {kind}", "cron": "@daily", "action": "prune",
-					"prune_type": kind, "show_output": True, "host": "h_local", "enabled": True}
-			assert monitor._execute_schedule_action(task) is True
-		assert time.time() - started < 1 and ran == [], "el bucle esperó al prune"
-
-		release.set()
-		deadline = time.time() + 5
-		while len(sent) < 2 and time.time() < deadline:
-			time.sleep(0.01)
-		assert ran == ["containers", "images"], ran
-		assert sent == ["ok containers", "ok images"], sent
-
-		# An unknown type still disables the task there and then.
-		disabled = []
-		original_update = dcb.schedule_manager.update_schedule
-		dcb.schedule_manager.update_schedule = lambda name, **kw: disabled.append(name)
-		try:
-			task = {"id": 2, "name": "rara", "cron": "@daily", "action": "prune",
-					"prune_type": "planets", "host": "h_local", "enabled": True}
-			assert monitor._execute_schedule_action(task) is False
-			assert disabled == ["rara"], disabled
-		finally:
-			dcb.schedule_manager.update_schedule = original_update
-	finally:
-		release.set()
-		dcb.manager, dcb.send_message = original
-		_restore_hosts()
-
-
-def test_a_schedule_on_an_unreachable_host_is_skipped_not_disabled():
-	"""
-	Not paused, just down for a moment: an ssh machine rebooting during the
-	nightly restart, or one still coming up when the @reboot tasks run. The
-	lookup turned "cannot ask" into "not found", and "not found" disables.
-	"""
-	_with_hosts(HOST_FIXTURE)   # nas no responde
-	disabled = []
-	messages = []
-	original = (dcb.schedule_manager.update_schedule, dcb.send_message, dcb.DockerManager.container_named)
-	dcb.schedule_manager.update_schedule = lambda name, **kwargs: disabled.append((name, kwargs))
-	dcb.send_message = lambda **kwargs: messages.append(kwargs) or None
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		for action in ("run", "stop", "restart", "exec"):
-			task = {"id": 1, "name": f"{action} nas", "cron": "@daily", "action": action,
-					"container": "plex", "host": "h_nas", "command": "ls", "enabled": True}
-			assert monitor._execute_schedule_action(task) is False
-		assert disabled == [], disabled
-		# Said once for the outage, naming the first task it cost, and not again.
-		assert [m["message"] for m in messages] == [
-			i18n.get_text("schedule_skipped_host_down", "run nas", "nas")], messages
-		messages.clear()
-
-		# A daemon that answers with an error is the same: nothing is known.
-		dcb.DockerManager.container_named = lambda self, name: (_ for _ in ()).throw(Exception("EOF"))
-		task = {"id": 2, "name": "local roto", "cron": "@daily", "action": "restart",
-				"container": "nginx", "host": "h_local", "enabled": True}
-		assert monitor._execute_schedule_action(task) is False
-		assert disabled == [], disabled
-
-		# But a host that answers "no such container" still disables, and so
-		# does a host the bot no longer has: those tasks can never run.
-		dcb.DockerManager.container_named = lambda self, name: None
-		assert monitor._execute_schedule_action(task) is False
-		task = {"id": 3, "name": "host borrado", "cron": "@daily", "action": "restart",
-				"container": "plex", "host": "h_gone", "enabled": True}
-		assert monitor._execute_schedule_action(task) is False
-		assert [name for name, _ in disabled] == ["local roto", "host borrado"], disabled
-	finally:
-		(dcb.schedule_manager.update_schedule, dcb.send_message, dcb.DockerManager.container_named) = original
-		_restore_hosts()
-
-
-def test_the_scheduler_evaluates_every_minute_exactly_once():
-	"""
-	It slept 60 s after doing the work and looked at whatever minute it landed
-	in, so every lap ran a little later and, sooner or later, one jumped from
-	:00:55 to :02:05: the task due at :01 never ran.
-	"""
-	from datetime import datetime
-	ran = []
-	tasks = [
-		{"name": "a la 1", "cron": "1 3 * * *", "action": "mute", "minutes": 1, "enabled": True},
-		{"name": "cada 5", "cron": "*/5 * * * *", "action": "mute", "minutes": 1, "enabled": True},
-		{"name": "apagada", "cron": "* * * * *", "action": "mute", "minutes": 1, "enabled": False},
-		{"name": "al arrancar", "cron": "@reboot", "action": "mute", "minutes": 1, "enabled": True},
-	]
-	original = dcb.schedule_manager.get_all_schedules
-	dcb.schedule_manager.get_all_schedules = lambda: tasks
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		monitor._execute_schedule_action = lambda task: ran.append(task["name"])
-
-		monitor._tick(datetime(2026, 10, 2, 3, 0, 55))
-		monitor._tick(datetime(2026, 10, 2, 3, 2, 5))     # se ha saltado las 3:01
-		assert ran == ["cada 5", "a la 1"], ran
-
-		ran.clear()
-		monitor._tick(datetime(2026, 10, 2, 3, 2, 40))    # el mismo minuto otra vez
-		assert ran == [], ran
-
-		# Making up several minutes runs a task once, not once per minute.
-		ran.clear()
-		monitor._tick(datetime(2026, 10, 2, 3, 6, 1))     # 3:03 a 3:06, con las 3:05
-		assert ran == ["cada 5"], ran
-
-		# The clock going back —the autumn change— does not run anything twice.
-		ran.clear()
-		monitor._tick(datetime(2026, 10, 2, 3, 5, 0))
-		assert ran == [], ran
-
-		# A gap too long to be a slow lap is not replayed: only the minute now.
-		ran.clear()
-		monitor._tick(datetime(2026, 10, 2, 9, 10, 0))
-		assert ran == ["cada 5"], ran
-	finally:
-		dcb.schedule_manager.get_all_schedules = original
-
-
-def test_reboot_tasks_run_in_the_daemon_not_when_it_is_built():
-	"""Built on the main thread: an exec that hangs held up the start of polling."""
-	ran = []
-	tasks = [{"name": "al arrancar", "cron": "@reboot", "action": "mute", "minutes": 1, "enabled": True},
-			{"name": "apagada", "cron": "@reboot", "action": "mute", "minutes": 1, "enabled": False}]
-	original = (dcb.schedule_manager.get_all_schedules, dcb.DockerScheduleMonitor._execute_schedule_action)
-	dcb.schedule_manager.get_all_schedules = lambda: tasks
-	dcb.DockerScheduleMonitor._execute_schedule_action = lambda self, task: ran.append(task["name"])
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		assert ran == [], "se ejecutó al construirlo"
-		monitor._execute_reboot_tasks()
-		assert ran == ["al arrancar"], ran
-	finally:
-		dcb.schedule_manager.get_all_schedules, dcb.DockerScheduleMonitor._execute_schedule_action = original
-
-
-def test_the_user_hears_when_a_host_whose_schedules_were_skipped_is_back():
-	"""
-	Checked every minute: a daily task would otherwise say so up to a day late.
-
-	Here only for the local host. A remote one's return is told by
-	HostAvailability, for every host, and saying it here too would be the same
-	news twice; it is still noted, so its next outage is told again.
-	"""
-	import host_registry
-	from datetime import datetime
-	_with_hosts(HOST_FIXTURE)   # nas no responde
-	messages = []
-	original = (dcb.send_message, dcb.schedule_manager.get_all_schedules, host_registry.status_snapshot)
-	dcb.send_message = lambda **kwargs: messages.append(kwargs.get("message")) or None
-	dcb.schedule_manager.get_all_schedules = lambda: []
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		monitor._down_hosts["h_nas"] = True
-		monitor._down_hosts["h_local"] = True
-		host_registry.status_snapshot = lambda entries=None, **kw: {e["id"]: (False, "down") for e in entries}
-		monitor._tick(datetime(2026, 10, 2, 3, 0))
-		assert messages == [] and set(monitor._down_hosts) == {"h_nas", "h_local"}, messages
-		host_registry.status_snapshot = lambda entries=None, **kw: {e["id"]: (True, "") for e in entries}
-		monitor._tick(datetime(2026, 10, 2, 3, 1))
-		monitor._tick(datetime(2026, 10, 2, 3, 2))
-		assert messages == [i18n.get_text("schedule_host_back", "casa")], messages
-		assert monitor._down_hosts == {}, monitor._down_hosts
-	finally:
-		(dcb.send_message, dcb.schedule_manager.get_all_schedules, host_registry.status_snapshot) = original
-		_restore_hosts()
-
-
-def test_removing_a_host_warns_about_the_schedules_it_would_orphan():
-	"""
-	A task naming a host that no longer exists raises HostUnavailable on every
-	firing, silently, for as long as its cron keeps coming round. The user has
-	to hear about it before the tap, not after.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	tasks = [
-		{"id": 1, "name": "Limpieza nas", "cron": "@hourly", "action": "prune",
-			"prune_type": "images", "host": "h_nas", "enabled": True},
-		{"id": 2, "name": "Reinicio local", "cron": "@daily", "action": "restart",
-			"container": "nginx", "host": "h_local", "enabled": True},
-		{"id": 3, "name": "Silencio", "cron": "@daily", "action": "mute",
-			"minutes": 60, "enabled": True},
-		{"id": 4, "name": "Apagada", "cron": "@daily", "action": "stop",
-			"container": "plex", "host": "h_nas", "enabled": False},
-	]
-	original = dcb.schedule_manager.get_all_schedules
-	dcb.schedule_manager.get_all_schedules = lambda: tasks
-	try:
-		affected = [t["name"] for t in dcb.schedules_on_host("h_nas")]
-		# Only the ones that would break: another host's task is not affected,
-		# a mute belongs to no machine, and a disabled task was not running.
-		assert affected == ["Limpieza nas"], affected
-
-		text, _markup = dcb.build_settings_host_remove("h_nas")
-		assert "Limpieza nas" in text, text
-		assert "Reinicio local" not in text, text
-		assert "Silencio" not in text, text
-	finally:
-		dcb.schedule_manager.get_all_schedules = original
-		_restore_hosts()
-
-
-def test_a_task_created_before_hosts_existed_counts_as_local():
-	"""It carries no host and means the machine it was set up on."""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	tasks = [{"id": 1, "name": "Vieja", "cron": "@daily", "action": "restart",
-				"container": "nginx", "enabled": True}]
-	original = dcb.schedule_manager.get_all_schedules
-	dcb.schedule_manager.get_all_schedules = lambda: tasks
-	try:
-		assert [t["name"] for t in dcb.schedules_on_host("h_local")] == ["Vieja"]
-		assert dcb.schedules_on_host("h_nas") == []
-	finally:
-		dcb.schedule_manager.get_all_schedules = original
-		_restore_hosts()
-
-
-def test_orphaned_schedules_are_disabled_and_not_deleted():
-	"""
-	Re-adding the host and switching them back on is a couple of taps; a
-	deleted cron expression is gone for good. Same choice the executor already
-	makes with a task it cannot run.
-	"""
-	tasks = [{"id": 1, "name": "Limpieza nas", "cron": "@hourly", "action": "prune",
-				"prune_type": "images", "host": "h_nas", "enabled": True}]
-	updates = []
-	original = dcb.schedule_manager.update_schedule
-	dcb.schedule_manager.update_schedule = lambda name, **kw: (
-		updates.append((name, kw)) or True)
-	original_delete = dcb.schedule_manager.delete_schedule
-	deleted = []
-	dcb.schedule_manager.delete_schedule = lambda name: deleted.append(name)
-	try:
-		assert dcb.disable_schedules(tasks) == ["Limpieza nas"]
-		assert updates == [("Limpieza nas", {"enabled": False})], updates
-		assert deleted == [], deleted
-	finally:
-		dcb.schedule_manager.update_schedule = original
-		dcb.schedule_manager.delete_schedule = original_delete
-
-
-def test_a_mute_task_belongs_to_no_host():
-	"""
-	Muting silences the bot's own notifications. Showing it a host would be
-	claiming something that means nothing, and the first version of this
-	stamped one onto every task alike.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	original = dcb.send_message
-	dcb.send_message = lambda *a, **kw: None
-	original_save = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		# Even with one stored, the summary does not show it.
-		summary = dcb._build_schedule_summary(
-			{"name": "silencio", "action": "mute", "minutes": 30, "host": "h_nas"})
-		assert dcb.get_text("schedule_label_host") not in summary, summary
-
-		# And confirming clears it rather than pinning the local one.
-		state = {"name": "silencio", "action": "mute", "minutes": 30}
-		dcb.confirm_schedule_creation(1, state)
-		assert state["host"] is None, state
-
-		# While a task that does act on Docker still gets one.
-		state = {"name": "limpieza", "action": "prune", "prune_type": "images"}
-		dcb.confirm_schedule_creation(1, state)
-		assert state["host"] == "h_local", state
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_save
-		_restore_hosts()
-
-
 def test_every_schedule_action_explains_itself_in_the_users_language():
 	"""
 	The picker used to hardcode six buttons reading `run`, `stop`, `restart`...
@@ -4233,150 +3664,6 @@ def test_every_schedule_action_explains_itself_in_the_users_language():
 		keys = i18n.load_locale(locale)
 		for action in dcb.SCHEDULE_ACTIONS:
 			assert f"schedule_action_{action}" in keys, (locale, action)
-
-
-def test_the_action_picker_offers_exactly_the_actions_it_explains():
-	"""One list, so the buttons and the legend cannot drift apart again."""
-	captured = {}
-	original = dcb.send_message
-	dcb.send_message = lambda message="", reply_markup=None, **kw: captured.update(
-		message=message, reply_markup=reply_markup) or None
-	original_state = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		dcb.handle_schedule_flow(1, "0 0 * * *", {"step": "ask_cron", "name": "prueba"})
-		text = captured.get("message", "")
-		markup = captured.get("reply_markup")
-		offered = [c.split("|", 1)[1] for c in harness.keyboard_callbacks(markup)
-					if c.startswith("scheduleSelectAction|")]
-		assert offered == list(dcb.SCHEDULE_ACTIONS), offered
-		for action in dcb.SCHEDULE_ACTIONS:
-			assert i18n.get_text(f"schedule_action_{action}") in text, action
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_state
-
-
-def test_every_schedule_action_is_classified():
-	"""
-	A new action missing from the set would silently be treated as belonging
-	to no host, and its task would run wherever the executor guessed.
-	"""
-	from config import HOST_SCOPED_SCHEDULE_ACTIONS, SCHEDULE_PATTERNS
-
-	unclassified = set(SCHEDULE_PATTERNS) - HOST_SCOPED_SCHEDULE_ACTIONS - {"mute"}
-	assert not unclassified, f"acciones sin clasificar: {sorted(unclassified)}"
-	assert HOST_SCOPED_SCHEDULE_ACTIONS <= set(SCHEDULE_PATTERNS)
-
-
-def test_the_flow_asks_in_the_order_the_summary_lists():
-	"""
-	So the summary only grows downwards as the answers come in and the last
-	thing answered is the last line, instead of appearing in the middle.
-	"""
-	order = ["name", "cron", "action", "container", "minutes", "prune_type",
-			"host", "show_output", "command"]
-	state = {key: "x" for key in order}
-	state["action"] = "prune"
-	state["show_output"] = True
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	try:
-		summary = dcb._build_schedule_summary(state)
-		labels = [
-			("prune_type", dcb.get_text("schedule_label_prune_type")),
-			("host", dcb.get_text("schedule_label_host")),
-			("show_output", dcb.get_text("schedule_label_show_output")),
-		]
-		positions = [summary.index(label) for _, label in labels]
-		assert positions == sorted(positions), summary
-	finally:
-		_restore_hosts()
-
-
-def test_a_scheduled_prune_is_asked_which_host():
-	"""
-	It picks no container, so nothing else in the flow would say where it runs.
-	Interactive /prune asks the machine before the object type; this follows it
-	for the same reason: it deletes things.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	captured = {}
-	original = dcb.send_message
-	dcb.send_message = lambda **kwargs: captured.update(kwargs)
-	original_save = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		dcb.ask_schedule_prune_host(1, {"name": "nightly", "action": "prune"})
-		callbacks = harness.keyboard_callbacks(captured["reply_markup"])
-		assert "scheduleSelectHost|h_local" in callbacks, callbacks
-		assert "scheduleSelectHost|h_nas" in callbacks, callbacks
-		for data in callbacks:
-			callback_registry.parse(data)
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_save
-		_restore_hosts()
-
-
-def test_the_prune_type_step_offers_the_four_kinds():
-	captured = {}
-	original = dcb.send_message
-	dcb.send_message = lambda **kwargs: captured.update(kwargs)
-	original_save = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		dcb.ask_schedule_prune_type(1, {"name": "nightly", "action": "prune"})
-		callbacks = harness.keyboard_callbacks(captured["reply_markup"])
-		for kind in ("containers", "images", "networks", "volumes"):
-			assert f"scheduleSelectPruneType|{kind}" in callbacks, callbacks
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_save
-
-
-def test_a_task_always_ends_up_with_a_host():
-	"""
-	Confirming records the local host when nothing asked for one, so the
-	executor never has to guess.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	state = {"name": "nightly", "action": "prune", "prune_type": "images"}
-	original = dcb.send_message
-	dcb.send_message = lambda **kwargs: None
-	original_save = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		dcb.confirm_schedule_creation(1, state)
-		assert state["host"] == "h_local", state
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_save
-		_restore_hosts()
-
-
-def test_the_schedule_summary_says_which_machine():
-	"""
-	A prune task picks no container, so nothing implies its host. Leaving it
-	blank and falling back silently is what this avoids.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	try:
-		summary = dcb._build_schedule_summary(
-			{"name": "nightly", "action": "prune", "prune_type": "images", "host": "h_nas"})
-		assert "nas" in summary, summary
-
-		# Not defaulted: the step that asks for the host renders this summary
-		# above the question, and a fallback would claim one while still asking.
-		asking = dcb._build_schedule_summary({"name": "nightly", "action": "prune"})
-		assert dcb.get_text("schedule_label_host") not in asking, asking
-
-		# With one host the summary reads as it always did.
-		_with_hosts([HOST_FIXTURE[0]], unreachable=())
-		summary = dcb._build_schedule_summary(
-			{"name": "nightly", "action": "prune", "prune_type": "images"})
-		assert "casa" not in summary, summary
-	finally:
-		_restore_hosts()
 
 
 def test_the_start_header_counts_every_host():
@@ -4459,12 +3746,13 @@ def test_a_prune_that_fails_says_so_instead_of_raising():
 		getattr(owner.client, collection).prune.side_effect = busy
 	try:
 		for kind in ("containers", "images", "networks", "volumes"):
-			message, details = getattr(owner, f"prune_{kind}")()
+			message, details, cleaned = getattr(owner, f"prune_{kind}")()
 			assert details is None and message == i18n.get_text(f"error_prune_{kind}"), kind
 		owner.client.images.prune.side_effect = None
 		owner.client.images.prune.return_value = {"ImagesDeleted": None}
-		message, details = owner.prune_images()
+		message, details, cleaned = owner.prune_images()
 		assert details is not None and "0.0B" in message, message
+		assert cleaned is False, "no ha borrado nada"
 	finally:
 		host_registry.slow_client = original_slow
 		_restore_hosts()
@@ -4475,7 +3763,7 @@ def test_a_prune_that_fails_says_so_instead_of_raising():
 	sent, documents, steps = [], [], []
 	original = (dcb.manager, dcb.send_message, dcb.send_document, dcb.delete_message)
 	failing = MagicMock()
-	failing.prune_images.side_effect = lambda: steps.append("prune") or ("falló", None)
+	failing.prune_images.side_effect = lambda: steps.append("prune") or ("falló", None, False)
 	dcb.manager = lambda host_id=None: failing
 
 	def sending(**kw):
@@ -4500,8 +3788,8 @@ def test_a_prune_that_fails_says_so_instead_of_raising():
 		sent.clear(), steps.clear()
 		press = MagicMock()
 		press.data, press.id = "prune|pruneImages|h_local", "q2"
-		press.message.id, press.message.chat.id = 2, 1
 		press.from_user.id = int(str(dcb.TELEGRAM_ADMIN).split(",")[0])
+		press.message.id, press.message.chat.id, press.message.chat.type = 2, press.from_user.id, "private"
 		dcb.button_controller(press)
 		assert steps[0] == ("delete", 2) and steps[1:] == [("send", 1), "prune", ("delete", 91), ("send", 2)], steps
 	finally:
@@ -4525,14 +3813,14 @@ def test_a_prune_runs_with_the_slow_client_and_says_when_it_ran_out_of_time():
 	host_registry.slow_client = lambda host_id: slow
 	try:
 		slow.images.prune.return_value = {"SpaceReclaimed": 1024}
-		message, details = owner.prune_images()
-		assert details is not None, message
+		message, details, cleaned = owner.prune_images()
+		assert details is not None and cleaned, message
 		slow.images.prune.assert_called_once_with(filters={'dangling': False})
 		owner.client.images.prune.assert_not_called()
 
 		slow.images.prune.side_effect = requests.exceptions.ReadTimeout(
 			"UnixHTTPConnectionPool(host='localhost', port=None): Read timed out. (read timeout=600)")
-		message, details = owner.prune_images()
+		message, details, cleaned = owner.prune_images()
 		minutes = str(host_registry.SLOW_TIMEOUT_SECONDS // 60)
 		assert details is None, message
 		assert message == i18n.get_text("error_prune_timeout", minutes, "docker image prune -a -f"), message
@@ -4544,7 +3832,7 @@ def test_a_prune_runs_with_the_slow_client_and_says_when_it_ran_out_of_time():
 		slow.images.prune.side_effect = docker.errors.APIError(
 			"409 Client Error: Conflict", response=response,
 			explanation="a prune operation is already running")
-		message, details = owner.prune_images()
+		message, details, cleaned = owner.prune_images()
 		assert details is None and message == i18n.get_text("error_prune_busy"), message
 	finally:
 		host_registry.slow_client = original_slow
@@ -5037,7 +4325,7 @@ def test_nothing_answers_a_callback_without_the_guard():
 	abort a press the next time the network hiccups.
 	"""
 	for filename in ("core.py", "callbacks.py", "commands.py"):
-		source = io.open(os.path.join(harness.REPO, filename), encoding="utf-8").read()
+		source = io.open(os.path.join(harness.SRC, filename), encoding="utf-8").read()
 		for line_number, line in enumerate(source.split("\n"), start=1):
 			if "answer_callback_query(" in line and "def " not in line:
 				assert "answer_callback_quietly" in line or "bot.answer_callback_query(callback_id" in line, \
@@ -5097,7 +4385,7 @@ def test_anything_that_repaints_in_place_keeps_its_message():
 	# The ones that deliberately hand the message over to something else: a
 	# text prompt, or whatever a command opens.
 	replaces_message = {"settingsAskInterval", "settingsAskChannel", "cancelTextInput",
-						"settingsHostAdd", "settingsHostRename",
+						"settingsHostAdd", "settingsHostRename", "settingsHostUrl",
 						"cerrar", "startCommand"}
 	emitted = set()
 	for markup in _all_keyboards():
@@ -5121,11 +4409,16 @@ def test_the_registry_matches_4_2_0_exactly():
 	registry = callback_registry.specs()
 	for name in baseline["_dead_in_4_2_0"]:
 		assert name not in registry, f"{name} era una declaración muerta"
+	removed = set(baseline["_removed_after_4_2_0"])
+	for name in removed:
+		assert name not in registry, f"{name} se quitó a propósito y ha vuelto"
 
-	missing = set(baseline["callbacks"]) - set(registry)
+	missing = set(baseline["callbacks"]) - set(registry) - removed
 	assert not missing, f"callbacks de 4.2.0 perdidos: {sorted(missing)}"
 
 	for name, expected in sorted(baseline["callbacks"].items()):
+		if name in removed:
+			continue
 		spec = registry[name]
 		assert list(spec.params) == expected["params"], f"{name}: params"
 		assert spec.keeps_message == expected["keeps_message"], f"{name}: keeps_message"
@@ -5290,20 +4583,13 @@ def test_a_translation_keeps_the_markup_of_the_original():
 
 def test_the_cron_examples_survive_in_every_language():
 	"""
-	The specific thing the markup check found, pinned on its own: this string
-	is the only help the user gets on cron syntax, and an example without its
-	asterisks teaches the wrong format.
+	The specific thing the markup check found, pinned on its own: the
+	question that asks for the cron is the help the user gets on its syntax,
+	and an example without its asterisks teaches the wrong format.
 	"""
-	base = i18n.load_locale("es")["error_adding_schedule"]
-	expected = base.count("*")
-	assert expected >= 9, "el original ya no lleva ejemplos de cron"
 	for locale in _locale_names():
-		text = i18n.load_locale(locale)["error_adding_schedule"]
-		assert text.count("*") == expected, (
-			f"{locale}: el ejemplo de cron lleva {text.count('*')} asteriscos "
-			f"en vez de {expected}")
-		assert "<b>" not in text, (
-			f"{locale}: los asteriscos del cron se han vuelto <b> otra vez")
+		text = i18n.load_locale(locale)["schedule_ask_cron"]
+		assert "'0 0 * * *'" in text, f"{locale}: el ejemplo de cron ha perdido sus asteriscos"
 
 
 def _batch_stubs(results, extended=False, own=(), current=()):
@@ -5665,6 +4951,36 @@ def test_confirming_finds_a_container_recreated_since_the_list_was_sent():
 		dcb.clear_update_data(7, 70)
 
 
+def test_confirming_does_not_update_another_container_that_shares_the_id_prefix():
+	"""
+	The list keeps five characters of each ID. With the listed container
+	recreated since —Watchtower, compose up—, another whose ID starts the
+	same was all the reference found, and confirming updated that one. It
+	counts only with the listed name: the listed one is looked for by it,
+	updated if it came back with another ID, and reported missing if not.
+	"""
+	ref = dcb.make_ref("h_local", "ff2e3")
+	other, plex = _container("c1015", "running"), _container("plex", "running")
+	other.id, plex.id = "ff2e3" + "1" * 59, "beef0" + "0" * 59
+	live = {ref: other, dcb.make_ref("h_local", "beef0"): plex}
+	batches = []
+	original = (dcb.update_containers, dcb.find_container, dcb.find_container_id_on_host, dcb.update_available)
+	dcb.update_containers = lambda targets, **kw: batches.append((targets, kw))
+	dcb.find_container = lambda r: (MagicMock(host_id="h_local"), live[r]) if r in live else (None, None)
+	dcb.update_available = lambda container, host_id: True
+	try:
+		for recreated, expected in ((False, ([], {"up_to_date": [], "missing": [("h_local", "plex")]})),
+									(True, ([(dcb.make_ref("h_local", "beef0"), "plex")], {"up_to_date": [], "missing": []}))):
+			batches.clear()
+			dcb.find_container_id_on_host = lambda host_id, name: "beef0" if recreated and name == "plex" else None
+			dcb.save_update_data(8, 80, [[ref, "plex"]], {ref})
+			callbacks.cb_updateSelected(_update_ctx("updateSelected", 8, 81, originalMessageId="80"))
+			assert batches == [expected], (recreated, batches)
+	finally:
+		(dcb.update_containers, dcb.find_container, dcb.find_container_id_on_host, dcb.update_available) = original
+		dcb.clear_update_data(8, 80)
+
+
 def test_an_update_list_that_expired_says_so():
 	"""
 	After a week, or an upgrade from 4.x, the list's data is gone. A tap
@@ -5820,8 +5136,8 @@ def test_a_press_counts_the_button_and_never_its_arguments():
 		try:
 			press = MagicMock()
 			press.data, press.id = "settingsHost|h_nas", "q1"
-			press.message.id, press.message.chat.id = 2, 1
 			press.from_user.id = int(str(dcb.TELEGRAM_ADMIN).split(",")[0])
+			press.message.id, press.message.chat.id, press.message.chat.type = 2, press.from_user.id, "private"
 			dcb.button_controller(press)
 		finally:
 			dcb.send_message, dcb.edit_message_text, dcb.delete_message = saved
@@ -6133,8 +5449,8 @@ def test_every_question_answered_by_typing_goes_through_typed_prompt():
 	"""
 	typed = ("schedule_ask_name", "schedule_ask_cron", "schedule_ask_minutes",
 			"schedule_ask_command", "prompt_enter_command", "ports_ask_port")
-	for filename in ("core.py", "callbacks.py"):
-		source = io.open(os.path.join(harness.REPO, filename), encoding="utf-8").read()
+	for filename in ("core.py", "callbacks.py", "schedules.py"):
+		source = io.open(os.path.join(harness.SRC, filename), encoding="utf-8").read()
 		for key in typed:
 			assert not re.search(r"get_text\(\s*['\"]" + key + r"['\"]", source), (filename, key)
 
@@ -6343,3 +5659,1994 @@ def test_a_monitor_told_to_retry_stops_waiting():
 		host_registry.drop = original_drop
 		_restore_hosts()
 	assert not monitor.thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Lo que arregla la revisión de la 5.1.1
+# ---------------------------------------------------------------------------
+
+def test_a_pending_question_is_answered_only_where_and_while_it_was_asked():
+	"""A loose message, days later and in another chat, used to answer it."""
+	state = {"asked_in": "555", "asked_at": time.time()}
+	assert dcb.answerable(state, 555) is state
+	assert dcb.answerable(state, 666) is None, "otro chat"
+	stale = dict(state, asked_at=time.time() - dcb.PENDING_ANSWER_SECONDS - 1)
+	assert dcb.answerable(stale, 555) is None, "caducada"
+	assert dcb.answerable({"field": "x"}, 555) is None, "sin sello, de antes de esta versión"
+
+
+def test_a_project_stop_restart_or_delete_leaves_the_bot_alone():
+	"""It went through every container of the project, the bot's own included."""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	me = _container("docker-controller-bot", "running")
+	me.id = "1" * 64
+	web = _container("web", "running")
+	undo = _pretend_to_be(me)
+	project = MagicMock(containers=[me, web])
+	owner = dcb.manager("h_local")
+	original = (owner.get_project_info, dcb.send_message)
+	owner.get_project_info = lambda name: project
+	sent = []
+	dcb.send_message = lambda **kw: sent.append(kw.get("message", "")) or MagicMock()
+	store.set_container_update_mode("h_local", "web", "auto")
+	try:
+		rest, own = dcb.without_the_bot("h_local", [me, web])
+		assert rest == [web] and own == [me]
+		dcb.delete_compose_project("homelab", "h_local")
+		me.remove.assert_not_called()
+		web.remove.assert_called_once_with(force=True)
+		assert any("docker-controller-bot" in text for text in sent), sent
+		# Deleted from the bot, what the bot kept about it goes with it.
+		assert store.container_update_mode("h_local", "web") is None
+	finally:
+		owner.get_project_info, dcb.send_message = original
+		store.forget_host_containers("h_local")
+		undo()
+		_restore_hosts()
+
+
+def test_a_typed_exec_says_it_is_still_running_instead_of_holding_the_worker():
+	"""The SDK reads an exec with no time limit, so a ping without -c held a worker for good."""
+	release = threading.Event()
+	sent = []
+	owner = MagicMock()
+	owner.execute_command = lambda **kw: release.wait(5) and ("pong", 0)
+	original = (dcb.manager_for, dcb.send_message, dcb.EXEC_WAIT_SECONDS)
+	dcb.manager_for = lambda ref: owner
+	dcb.send_message = lambda **kw: sent.append(kw.get("message", "")) or MagicMock()
+	dcb.EXEC_WAIT_SECONDS = 0.2
+	try:
+		started = time.monotonic()
+		dcb.execute_command("h_local:abc12", "web", "ping 8.8.8.8")
+		assert time.monotonic() - started < 2, "el handler tiene que quedar libre"
+		assert any(i18n.get_text("exec_still_running", "web") in text for text in sent), sent
+		release.set()
+		for _ in range(50):
+			if any("pong" in text for text in sent):
+				break
+			time.sleep(0.05)
+		assert any("pong" in text for text in sent), "el resultado llega al terminar"
+	finally:
+		release.set()
+		dcb.manager_for, dcb.send_message, dcb.EXEC_WAIT_SECONDS = original
+
+
+def test_a_scheduled_exec_does_not_wait_for_the_command():
+	"""Run in the scheduler's thread, a long one made it skip the minutes after it."""
+	release = threading.Event()
+	owner = MagicMock()
+	owner.execute_command = lambda **kw: release.wait(5) and ("ok", 0)
+	original = (dcb.manager_for, dcb.send_message)
+	dcb.manager_for = lambda ref: owner
+	dcb.send_message = lambda **kw: MagicMock()
+	try:
+		started = time.monotonic()
+		dcb.execute_command("h_local:abc12", "db", "pg_dumpall", False, wait=False)
+		assert time.monotonic() - started < 0.5
+	finally:
+		release.set()
+		dcb.manager_for, dcb.send_message = original
+
+
+def test_long_exec_output_goes_as_a_file():
+	"""In messages, 5 MB of output was some 1500 of them, with the queue blocked behind."""
+	sent, documents = [], []
+	original = (dcb.send_message, dcb.send_document)
+	dcb.send_message = lambda **kw: sent.append(kw.get("message", "")) or MagicMock()
+	dcb.send_document = lambda **kw: documents.append(kw) or MagicMock()
+	try:
+		dcb._send_exec_result("h_local:abc12", "web", "cat big.log", ("x" * 20000, 0))
+		assert len(sent) == 1 and len(documents) == 1, (len(sent), len(documents))
+		dcb._send_exec_result("h_local:abc12", "web", "false", None)
+		assert i18n.get_text("error_executing_command_container", "false", "web") in sent[-1]
+	finally:
+		dcb.send_message, dcb.send_document = original
+
+
+def test_an_exec_set_to_failures_only_speaks_when_there_is_something_to_say():
+	"""
+	A check run every few minutes that prints nothing when all is well sent a
+	"ran correctly" each time. In that mode a clean, silent run says nothing;
+	a failure or any output still does, and a failure without output no
+	longer reads as "ran correctly".
+	"""
+	sent, documents = [], []
+	original = (dcb.send_message, dcb.send_document)
+	dcb.send_message = lambda **kw: sent.append(kw.get("message", "")) or MagicMock()
+	dcb.send_document = lambda **kw: documents.append(kw) or MagicMock()
+	ok = i18n.get_text("command_executed_without_output")
+	try:
+		for quiet in (("", 0), ("  \n", 0), ("", None)):
+			dcb._send_exec_result("h_local:abc12", "web", "check.sh", quiet, only_failures=True)
+		assert sent == [], sent
+
+		dcb._send_exec_result("h_local:abc12", "web", "check.sh", ("", 1), only_failures=True)
+		assert ok not in sent[-1] and i18n.get_text("exec_no_output") in sent[-1], sent[-1]
+		assert i18n.get_text("exec_exit_code", "1") in sent[-1], sent[-1]
+
+		dcb._send_exec_result("h_local:abc12", "web", "check.sh", ("disco al 95%", 0), only_failures=True)
+		assert "disco al 95%" in sent[-1] and i18n.get_text("exec_exit_code", "0") not in sent[-1], sent[-1]
+
+		dcb._send_exec_result("h_local:abc12", "web", "check.sh", None, only_failures=True)
+		assert i18n.get_text("error_executing_command_container", "check.sh", "web") in sent[-1]
+
+		# A typed /exec says how it ended, and a failure with its code.
+		sent.clear()
+		dcb._send_exec_result("h_local:abc12", "web", "true", ("", 0))
+		dcb._send_exec_result("h_local:abc12", "web", "grep x f", ("grep: f: No such file", 2))
+		assert ok in sent[0] and i18n.get_text("exec_exit_code", "0") not in sent[0], sent[0]
+		assert i18n.get_text("exec_exit_code", "2") in sent[1], sent[1]
+		assert documents == []
+	finally:
+		dcb.send_message, dcb.send_document = original
+
+
+def test_the_manager_hands_back_what_the_command_printed_and_how_it_ended():
+	"""The exit code was read only to spot a missing shell, then thrown away."""
+	manager = dcb.DockerManager("h_local")
+	manager.client = MagicMock()
+	container = manager.client.containers.get.return_value
+	container.exec_run.return_value = MagicMock(exit_code=3, output=b"")
+	assert manager.execute_command("abc", "web", "exit 3") == ("", 3)
+	container.exec_run.return_value = MagicMock(exit_code=0, output=b"caf\xe9")
+	assert manager.execute_command("abc", "web", "cat f") == ("caf\ufffd", 0)
+
+
+def test_a_scheduled_exec_hands_its_setting_to_the_result():
+	"""The scheduler passes the stored value; the result decides from it."""
+	results = []
+	owner = MagicMock()
+	owner.execute_command = lambda **kw: ("", 0)
+	original = (dcb.manager_for, dcb._send_exec_result)
+	dcb.manager_for = lambda ref: owner
+	dcb._send_exec_result = lambda *a, **kw: results.append(kw.get("only_failures"))
+	try:
+		for mode in (True, dcb.SHOW_OUTPUT_FAILURES, False):
+			dcb.execute_command("h_local:abc12", "db", "check.sh", mode, wait=False)
+		deadline = time.time() + 5
+		while len(results) < 2 and time.time() < deadline:
+			time.sleep(0.01)
+		time.sleep(0.1)
+		assert sorted(results) == [False, True], results
+	finally:
+		dcb.manager_for, dcb._send_exec_result = original
+
+
+def test_what_counts_as_a_prune_that_removed_something():
+	assert dcb._pruned_anything({"NetworksDeleted": ["old_net"]}) is True
+	assert dcb._pruned_anything({"ContainersDeleted": ["abc"], "SpaceReclaimed": 0}) is True
+	assert dcb._pruned_anything({"SpaceReclaimed": 1024}) is True
+	assert dcb._pruned_anything({"ImagesDeleted": None, "SpaceReclaimed": 0}) is False
+	assert dcb._pruned_anything({"VolumesDeleted": [], "SpaceReclaimed": 0}) is False
+	assert dcb._pruned_anything(None) is False
+
+
+def test_only_the_daemons_own_refusal_means_the_shell_is_missing():
+	"""Output that merely mentioned the error ran the command twice more."""
+	manager = dcb.DockerManager("h_local")
+	missing = MagicMock(exit_code=126, output=b'OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH: unknown')
+	printed = MagicMock(exit_code=1, output=b"deploying...\nunable to start container process: web\n")
+	assert manager._is_executable_missing(missing, "sh") is True
+	assert manager._is_executable_missing(missing, "bash") is False
+	assert manager._is_executable_missing(printed, "sh") is False
+
+
+def test_a_confirmed_command_is_handed_out_once():
+	"""Read and cleared apart, a double tap ran the command twice."""
+	command_id = dcb.save_command_cache("reboot")
+	assert dcb.take_command_cache(command_id) == "reboot"
+	assert dcb.take_command_cache(command_id) is None
+
+
+def test_someone_who_is_not_an_admin_is_told_once_an_hour():
+	"""Answering every message let anyone fill the queue the notifications go through."""
+	queued = []
+	original = dcb.message_queue.add_message
+	dcb.message_queue.add_message = lambda *a, **kw: queued.append(a)
+	dcb._not_admin_told.clear()
+	try:
+		dcb.tell_not_admin(999, "x")
+		dcb.tell_not_admin(999, "x")
+		assert len(queued) == 1, queued
+	finally:
+		dcb.message_queue.add_message = original
+		dcb._not_admin_told.clear()
+
+
+def test_a_button_from_another_chat_does_nothing():
+	"""Only where commands are taken: a message left in an old group kept working there."""
+	ran = []
+	spec = callback_registry.get("settingsHosts")
+	original = spec.handler
+	spec.handler = lambda ctx: ran.append(ctx)
+	try:
+		press = MagicMock()
+		press.data, press.id = "settingsHosts", "q1"
+		press.from_user.id = int(next(iter(dcb.ADMIN_IDS)))
+		press.message.id, press.message.chat.id, press.message.chat.type = 2, -100123, "supergroup"
+		dcb.button_controller(press)
+		assert ran == []
+	finally:
+		spec.handler = original
+
+
+def test_a_picker_longer_than_a_keyboard_comes_in_pages():
+	"""More than about a hundred buttons and Telegram refused the whole message."""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	containers = [_container(f"c{index:03d}", "running") for index in range(120)]
+	try:
+		markup, _ = dcb.build_hierarchical_keyboard(containers, "Logs", host_id="h_local")
+		seen = harness.keyboard_callbacks(markup)
+		assert sum(1 for c in seen if c.startswith("logs|")) == dcb.UPDATE_KEYBOARD_PAGE_SIZE
+		assert "pickPage|Logs|h_local|1" in seen, seen[-5:]
+		markup, _ = dcb.build_hierarchical_keyboard(containers, "Logs", host_id="h_local", page=1)
+		assert sum(1 for c in harness.keyboard_callbacks(markup) if c.startswith("logs|")) == 40
+		assert dcb.count_actionable_buttons(markup) == 40, "las flechas no son botones de contenedor"
+	finally:
+		_restore_hosts()
+
+
+def test_compose_of_a_stopped_container_does_not_start_it():
+	"""A stopped container fell through to "run" in the /compose picker."""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	try:
+		markup, _ = dcb.build_hierarchical_keyboard([_container("old", "exited")], "Compose", host_id="h_local")
+		seen = harness.keyboard_callbacks(markup)
+		assert any(c.startswith("compose|") for c in seen), seen
+		assert not any(c.startswith("run|") for c in seen), seen
+	finally:
+		_restore_hosts()
+
+
+def test_the_update_check_skips_a_container_gone_since_the_listing():
+	"""A NotFound there threw away everything already found on the host."""
+	import docker
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	gone = _container("qbittorrent", "running", image="qbit:latest")
+	gone.listed = True
+	gone.reload.side_effect = docker.errors.NotFound("gone")
+	plex = _container("plex", "running", image="plex:latest")
+	plex.image.id = "sha256:old"
+	owner = MagicMock()
+	owner.client.api.pull.return_value = []
+	owner.client.images.get.return_value = MagicMock(id="sha256:new")
+	try:
+		found, _ = dcb.DockerUpdateMonitor()._check_host(HOST_FIXTURE[0], owner, False, [gone, plex])
+		assert [name for _, name in found] == ["plex"], found
+	finally:
+		dcb.save_container_update_status("plex:latest", "plex", None, "h_local")
+		_restore_hosts()
+
+
+class _FollowedLogs:
+	"""
+	A /logs followed in milliseconds instead of seconds, with the log, what
+	is sent and every edit in the open.
+	"""
+
+	def __init__(self, every=0.05, lasting=0.4):
+		self.log = {"web": "uno", "db": "uno"}
+		self.edits = []
+		self.sent = []
+		self.editable = True
+		self._timing = (every, lasting)
+
+	def __enter__(self):
+		self._original = (dcb.read_logs, dcb.edit_message_text_sync, dcb.send_message, dcb.save_container_refs,
+							dcb.LOGS_FOLLOW_EVERY, dcb.LOGS_FOLLOW_FOR)
+		dcb.LOGS_FOLLOW_EVERY, dcb.LOGS_FOLLOW_FOR = self._timing
+		dcb.read_logs = lambda ref, name: None if self.log[name] is None else f"<pre>{self.log[name]}</pre>"
+		dcb.save_container_refs = lambda *a, **k: None
+
+		def edit(text, chat_id, message_id, parse_mode="html", reply_markup=None):
+			self.edits.append((chat_id, message_id, text, harness.keyboard_callbacks(reply_markup)))
+			return MagicMock() if self.editable else None
+
+		def send(message=None, reply_markup=None, **kw):
+			sent = MagicMock(message_id=50 + len(self.sent))
+			sent.chat.id = kw.get("chat_id") or 1
+			self.sent.append((message, harness.keyboard_callbacks(reply_markup)))
+			return sent
+
+		dcb.edit_message_text_sync = edit
+		dcb.send_message = send
+		return self
+
+	def __exit__(self, *exc):
+		self.settle()
+		(dcb.read_logs, dcb.edit_message_text_sync, dcb.send_message, dcb.save_container_refs,
+			dcb.LOGS_FOLLOW_EVERY, dcb.LOGS_FOLLOW_FOR) = self._original
+
+	def settle(self, seconds=3):
+		"""Waits until nothing is being followed."""
+		deadline = time.time() + seconds
+		while dcb.log_followers._following and time.time() < deadline:
+			time.sleep(0.01)
+		assert not dcb.log_followers._following, "un seguimiento no ha terminado"
+
+
+def _following(text):
+	return text.endswith(f"<i>{i18n.get_text('logs_following', dcb.LOGS_FOLLOW_EVERY)}</i>")
+
+
+def _resting(text):
+	return i18n.get_text("logs_paused", "").rstrip() in text and not _following(text)
+
+
+def test_logs_are_followed_for_a_while_and_then_rest():
+	"""
+	Like `tail -f`, for half a minute: the message is repainted when the log
+	moves, never when it has not —an edit that changes nothing still counts
+	against Telegram's limits— and then left at rest saying when it was read.
+	"""
+	with _FollowedLogs() as followed:
+		dcb.logs("h_local:abc12", "web")
+		text, buttons = followed.sent[0]
+		assert _following(text) and buttons == ["logsPause|h_local:abc12", "cerrar"], followed.sent
+		time.sleep(0.12)
+		followed.log["web"] = "uno\ndos"
+		followed.settle()
+		texts = [text for _chat, _message, text, _buttons in followed.edits]
+		assert any("dos" in text and _following(text) for text in texts), texts
+		assert len(texts) <= 2, f"edita aunque el log no cambie: {texts}"
+		_chat, _message, last, buttons = followed.edits[-1]
+		assert _resting(last) and "dos" in last, last
+		assert dcb.datetime.now().strftime("%H:%M") in last
+		assert buttons == ["logsFollow|h_local:abc12", "cerrar"], buttons
+
+
+def test_pausing_rests_at_once_and_resuming_follows_again():
+	with _FollowedLogs(lasting=5) as followed:
+		dcb.logs("h_local:abc12", "web")
+		started = time.time()
+		dcb.log_followers.pause("h_local:abc12", "web", 1, 50)
+		followed.settle()
+		assert time.time() - started < 1, "la pausa esperó a que acabara el seguimiento"
+		assert len(followed.edits) == 1 and _resting(followed.edits[0][2]), followed.edits
+
+		dcb.LOGS_FOLLOW_FOR = 0.2
+		dcb.log_followers.follow("h_local:abc12", "web", 1, 50)
+		followed.settle()
+		first, last = followed.edits[1][2], followed.edits[-1][2]
+		assert _following(first) and _resting(last), followed.edits
+
+
+def test_a_closed_log_message_stops_being_followed():
+	"""Closing deletes the message: the next edit fails, and with it the thread."""
+	with _FollowedLogs() as followed:
+		followed.editable = False
+		dcb.logs("h_local:abc12", "web")
+		followed.log["web"] = "dos"
+		followed.settle()
+		assert len(followed.edits) == 1, followed.edits
+
+
+def test_one_log_is_followed_per_chat():
+	"""Two at once in a group would be twenty-four edits a minute, past the twenty it takes."""
+	with _FollowedLogs(lasting=5) as followed:
+		dcb.logs("h_local:abc12", "web")
+		dcb.logs("h_local:def34", "db")
+		time.sleep(0.1)
+		assert [(chat, message) for chat, message, _text, _buttons in followed.edits] == [(1, 50)], followed.edits
+		assert _resting(followed.edits[0][2])
+		assert list(dcb.log_followers._following) == [1] and dcb.log_followers._following[1]["message"] == 51
+		dcb.log_followers.pause("h_local:def34", "db", 1, 51)
+
+
+def test_resuming_twice_follows_once():
+	with _FollowedLogs(lasting=0.3) as followed:
+		dcb.log_followers.follow("h_local:abc12", "web", 1, 50)
+		dcb.log_followers.follow("h_local:abc12", "web", 1, 50)
+		followed.settle()
+		assert _resting(followed.edits[-1][2]), followed.edits
+		assert sum(1 for edit in followed.edits if _resting(edit[2])) == 1, followed.edits
+
+
+def test_a_log_followed_before_a_restart_can_still_be_paused():
+	"""Its thread is gone, but the message still says it is following."""
+	with _FollowedLogs() as followed:
+		dcb.log_followers.pause("h_local:abc12", "web", 1, 77)
+		assert len(followed.edits) == 1 and _resting(followed.edits[0][2]), followed.edits
+
+
+def test_a_log_that_cannot_be_read_any_more_rests_as_last_read():
+	with _FollowedLogs() as followed:
+		dcb.logs("h_local:abc12", "web")
+		followed.log["web"] = None
+		followed.settle()
+		last = followed.edits[-1][2]
+		assert _resting(last) and "uno" in last, last
+
+
+def test_the_log_window_keeps_the_end_from_a_whole_line_and_fits_telegram():
+	"""
+	The window drops the oldest at the top. It was cut by Python characters,
+	mid-line, and a log full of emoji —two of Telegram's each— went past 4096
+	and the message was refused.
+	"""
+	def units(text):
+		return len(text.encode("utf-16-le")) // 2
+
+	lines = "\n".join(f"línea {number}" for number in range(1, 500))
+	tail = formatting.telegram_tail(lines, 100)
+	assert tail.endswith("línea 499") and units(tail) <= 100, tail
+	assert tail.split("\n")[0].startswith("línea ") and tail.split("\n")[0] in lines.split("\n"), tail
+	# Cut right after a newline, the first line is already whole and stays.
+	assert formatting.telegram_tail("aaa\nbbb\nccc", 7) == "bbb\nccc"
+	# A single line longer than the window is all there is: its end, rather than nothing.
+	assert formatting.telegram_tail("x" * 50, 10) == "x" * 10
+	assert formatting.telegram_tail("corto", 100) == "corto"
+
+	emoji = "\n".join("🚀🔥🎉 ok" for _ in range(2000))
+	assert units(formatting.telegram_tail(emoji, 3500)) <= 3500
+
+	manager = dcb.DockerManager("h_local")
+	container = MagicMock()
+	container.logs.return_value = emoji.encode()
+	manager.client = MagicMock()
+	manager.client.containers.get.return_value = container
+	body = manager.show_logs("abc12", "web")
+	shown = html.unescape(re.sub(r"<[^>]+>", "", dcb.logs_message(body, True, dcb.datetime.now())))
+	assert units(shown) < 4096, units(shown)
+
+
+def test_exec_output_fits_telegram_and_the_rest_goes_as_a_file():
+	"""Cut at 3500 of Python's characters, a command printing emoji went past 4096 and nothing arrived."""
+	def units(text):
+		return len(text.encode("utf-16-le")) // 2
+
+	assert formatting.telegram_head("🚀" * 10, 7) == "🚀" * 3
+	assert formatting.telegram_head("corto", 100) == "corto"
+	sent, documents = [], []
+	original = (dcb.send_message, dcb.send_document)
+	dcb.send_message = lambda **kw: sent.append(kw.get("message", "")) or MagicMock()
+	dcb.send_document = lambda **kw: documents.append(kw) or MagicMock()
+	try:
+		output = "\n".join("🚀🔥🎉 ok" for _ in range(1000))
+		dcb._send_exec_result("h_local:abc12", "web", "🎉" * 400, (output, 2))
+		shown = html.unescape(re.sub(r"<[^>]+>", "", sent[-1]))
+		assert units(shown) < 4096, units(shown)
+		assert len(documents) == 1, "lo que no cabe va en un fichero"
+		sent.clear(), documents.clear()
+		dcb._send_exec_result("h_local:abc12", "web", "echo hola", ("🚀 hola", 0))
+		assert "🚀 hola" in sent[-1] and documents == []
+	finally:
+		dcb.send_message, dcb.send_document = original
+
+
+def test_logs_are_read_from_the_end_and_in_any_encoding():
+	"""The whole history was downloaded, and one byte that was not UTF-8 failed every /logs."""
+	manager = dcb.DockerManager("h_local")
+	container = MagicMock()
+	container.logs.return_value = b"caf\xe9 listo\n"
+	manager.client = MagicMock()
+	manager.client.containers.get.return_value = container
+	text = manager.show_logs("abc12", "web")
+	assert container.logs.call_args.kwargs.get("tail") == dcb.LOGS_TAIL_LINES
+	assert "listo" in text
+	container.logs.return_value = iter([b"a" * 10, b"\nb" * 5])
+	original = dcb.LOGFILE_MAX_BYTES
+	dcb.LOGFILE_MAX_BYTES = 8
+	try:
+		text, cut = manager.show_logs_raw("abc12", "web")
+		assert cut and len(text.encode()) <= 8, (text, cut)
+	finally:
+		dcb.LOGFILE_MAX_BYTES = original
+	manager.client.containers.get.side_effect = Exception("gone")
+	assert manager.show_logs_raw("abc12", "web") is None
+	assert manager.get_docker_compose("abc12", "web") is None
+
+
+def test_a_failed_update_that_never_stopped_the_parent_leaves_the_dependents():
+	"""A refused update still recreated the services sharing its network."""
+	parent = MagicMock(id="p" * 64)
+	parent.attrs = {"State": {"StartedAt": "2026-10-01T00:00:00Z", "Running": True}}
+	plan = types.SimpleNamespace(old_id="p" * 64, old_started_at="2026-10-01T00:00:00Z")
+	assert dcb._parent_untouched(plan, parent) is True
+	parent.attrs = {"State": {"StartedAt": "2026-10-19T10:00:00Z", "Running": True}}
+	assert dcb._parent_untouched(plan, parent) is False, "se paró y se volvió a arrancar"
+	assert dcb._parent_untouched(plan, None) is False
+
+
+def test_a_lone_match_with_a_silent_host_is_asked_about():
+	"""A '/stop plex' meant for the silent host's plex stopped the namesake without asking."""
+	plex = _container("plex", "running")
+	original = (dcb.hosts_with_containers, dcb.unreachable_hosts)
+	dcb.hosts_with_containers = lambda comando="": [(HOST_FIXTURE[0], None, [plex])]
+	try:
+		dcb.unreachable_hosts = lambda sections: [HOST_FIXTURE[1]]
+		ref, _name, candidates = dcb.resolve_container_argument("plex")
+		assert ref is None and len(candidates) == 1
+		dcb.unreachable_hosts = lambda sections: []
+		ref, _name, candidates = dcb.resolve_container_argument("plex")
+		assert ref and not candidates
+	finally:
+		dcb.hosts_with_containers, dcb.unreachable_hosts = original
+
+
+def test_a_split_listing_never_ends_in_an_empty_piece():
+	"""The last piece carries the keyboard, and '<pre></pre>' alone is refused."""
+	lines = ["<pre>"] + [f"🟢 {'n' * 30}{index}" for index in range(400)] + ["</pre>"]
+	for budget in range(1000, 1400, 7):
+		for piece in dcb.split_for_telegram("\n".join(lines), budget):
+			assert re.sub(r"</?\w+>", "", piece).strip(), (budget, piece)
+
+
+def test_a_registry_cannot_send_the_bot_anywhere_for_a_token():
+	"""The realm comes in the registry's answer and was asked whatever it was."""
+	assert dcb._realm_allowed("https://auth.docker.io/token", "https://registry-1.docker.io/v2/x")
+	assert not dcb._realm_allowed("http://auth.example.com/token", "https://registry.example.com/v2/x")
+	assert not dcb._realm_allowed("https://192.168.1.1/reboot", "https://registry.evil.tld/v2/x")
+	assert dcb._realm_allowed("https://192.168.1.5/token", "https://192.168.1.5:5000/v2/x")
+	assert dcb._realm_allowed("http://localhost:5001/token", "http://localhost:5000/v2/x")
+
+
+def test_a_scheduled_mute_never_shortens_a_longer_one():
+	"""A half-hour task cut a mute until morning short."""
+	original = dcb.send_message
+	dcb.send_message = lambda **kw: MagicMock()
+	try:
+		dcb.mute(480)
+		until = dcb._mute_until()
+		dcb.mute(30, extend_only=True)
+		assert dcb._mute_until() == until
+		dcb.mute(600, extend_only=True)
+		assert dcb._mute_until() > until
+	finally:
+		dcb.unmute()
+		dcb.send_message = original
+
+
+def test_the_platform_manifest_decides_an_update_on_containerd():
+	"""A republished index changed the id, not what this container runs."""
+	container = MagicMock()
+	container.attrs = {"ImageManifestDescriptor": {"digest": "sha256:amd64"}}
+	image = MagicMock(id="sha256:newindex")
+	client = MagicMock()
+	client.api._result.return_value = {"Manifests": [
+		{"Kind": "image", "ID": "sha256:amd64"}, {"Kind": "attestation", "ID": "sha256:att"}]}
+	assert dcb.same_running_manifest(client, container, "sha256:oldindex", image) is True
+	client.api._result.return_value = {"Manifests": [{"Kind": "image", "ID": "sha256:other"}]}
+	assert dcb.same_running_manifest(client, container, "sha256:oldindex", image) is False
+	container.attrs = {}
+	assert dcb.same_running_manifest(client, container, "sha256:oldindex", image) is False
+
+
+def test_a_reply_outside_a_forum_is_in_the_general_topic():
+	"""Telegram fills message_thread_id in any reply; only forums have topics."""
+	message = MagicMock()
+	message.chat.is_forum = False
+	message.message_thread_id = 4242
+	assert dcb.topic_of(message) == 1
+	message.chat.is_forum = True
+	assert dcb.topic_of(message) == 4242
+
+
+def test_the_bots_own_token_stays_out_of_its_compose():
+	"""Sent in the clear, it stayed in the group's history."""
+	original = dcb.extract_container_config, dcb.ComposeGenerator
+	class Generator:
+		def __init__(self, name, config):
+			pass
+		def to_yaml(self):
+			return f"environment:\n  - TELEGRAM_TOKEN={dcb.TELEGRAM_TOKEN}\n"
+	dcb.extract_container_config, dcb.ComposeGenerator = (lambda container: {}), Generator
+	try:
+		text = dcb.generate_docker_compose(MagicMock())
+		assert dcb.TELEGRAM_TOKEN not in text and "${TELEGRAM_TOKEN}" in text, text
+	finally:
+		dcb.extract_container_config, dcb.ComposeGenerator = original
+
+
+def test_a_silent_host_does_not_make_a_button_say_the_container_is_gone():
+	"""It closed the list of updates and said the container did not exist."""
+	import host_registry
+	original = dcb.manager
+	def unreachable(host_id=None):
+		raise host_registry.HostUnavailable(host_id, "timed out")
+	dcb.manager = unreachable
+	try:
+		assert dcb.locate_container_on_host("h_nas", "plex") == (None, "timed out")
+	finally:
+		dcb.manager = original
+
+
+def test_the_shutdown_waits_for_dependents_being_restarted():
+	"""Stopped while they waited for their parent, they stayed stopped."""
+	seen = []
+	wrapped = dcb._counted_as_dependents_work(lambda: seen.append(dcb.dependents_in_progress()))
+	wrapped()
+	assert seen == [1] and dcb.dependents_in_progress() == 0
+
+
+# --- Lo que hace la comprobación con cada contenedor ---------------------------
+
+def test_a_dcb_label_decides_over_the_setting_chosen_in_the_bot():
+	"""
+	The label is in the compose and the bot cannot change it, so it wins
+	whatever it says, `=false` included. Ignoring wins over updating, as it
+	always has.
+	"""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	try:
+		store.set_container_update_mode("h_nas", "plex", "auto")
+		assert dcb.update_mode("h_nas", "plex", {}) == ("auto", None)
+		assert dcb.update_mode("h_local", "plex", {}) == (None, None)
+		assert dcb.update_mode("h_nas", "plex", {dcb.LABEL_AUTO_UPDATE: "false"}) == (None, dcb.LABEL_AUTO_UPDATE)
+		assert dcb.update_mode("h_nas", "plex", {dcb.LABEL_IGNORE_CHECK_UPDATES: ""}) == (
+			"ignore", dcb.LABEL_IGNORE_CHECK_UPDATES)
+		both = {dcb.LABEL_IGNORE_CHECK_UPDATES: "", dcb.LABEL_AUTO_UPDATE: ""}
+		assert dcb.update_mode("h_nas", "plex", both)[0] == "ignore"
+		# Whatever a listing hands over that is not a dict is no label at all.
+		assert dcb.update_mode("h_nas", "plex", MagicMock()) == ("auto", None)
+	finally:
+		store.set_container_update_mode("h_nas", "plex", None)
+		_restore_hosts()
+
+
+def test_an_ignored_container_is_never_pending():
+	"""A /checkupdate on it records what it finds, and it stayed in /updateall for good."""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	plex = _container("plex", "running", image="plex:latest")
+	was_checking = store.get("bot.check_updates")
+	store.set("bot.check_updates", True)
+	try:
+		dcb.save_container_update_status("plex:latest", "plex", True, "h_local")
+		assert dcb.update_available(plex, "h_local") is True
+		store.set_container_update_mode("h_local", "plex", "ignore")
+		assert dcb.update_available(plex, "h_local") is False
+	finally:
+		store.set_container_update_mode("h_local", "plex", None)
+		dcb.save_container_update_status("plex:latest", "plex", None, "h_local")
+		store.set("bot.check_updates", was_checking)
+		_restore_hosts()
+
+
+def test_going_into_ignore_or_out_of_it_forgets_what_the_cache_knew():
+	"""
+	Kept, an update announced before ignoring was taken, once back out, for one
+	already announced, and was never announced again.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	cached = lambda: dcb.read_container_update_status("plex:latest", "plex", "h_local")
+	try:
+		dcb.save_container_update_status("plex:latest", "plex", True, "h_local")
+		assert dcb.set_update_mode("h_local", "plex", {}, "plex:latest", "ignore") is None
+		assert cached() is None
+		dcb.save_container_update_status("plex:latest", "plex", True, "h_local")
+		assert dcb.set_update_mode("h_local", "plex", {}, "plex:latest", None) is None
+		assert cached() is None
+		# Between the other two it stays: nothing it said stops being true.
+		dcb.save_container_update_status("plex:latest", "plex", True, "h_local")
+		assert dcb.set_update_mode("h_local", "plex", {}, "plex:latest", "auto") is None
+		assert cached() is True
+		assert store.container_update_mode("h_local", "plex") == "auto"
+	finally:
+		store.set_container_update_mode("h_local", "plex", None)
+		dcb.save_container_update_status("plex:latest", "plex", None, "h_local")
+		_restore_hosts()
+
+
+def test_a_setting_is_refused_where_it_would_not_hold():
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	original = (dcb.own_container, dcb.CONTAINER_NAME)
+	try:
+		labelled = {dcb.LABEL_IGNORE_CHECK_UPDATES: ""}
+		assert dcb.set_update_mode("h_local", "proxy", labelled, "proxy:latest", "auto") == dcb.get_text(
+			"container_updates_by_label", dcb.LABEL_IGNORE_CHECK_UPDATES)
+		assert dcb.set_update_mode("h_gone", "plex", {}, "plex:latest", "auto") == dcb.get_text("error_can_not_do_that")
+		# Unable to tell which container it is, the bot does not put what may
+		# be itself on the ordinary update path: that stops it halfway. A
+		# CONTAINER_NAME does not change that: it may well not match.
+		dcb.own_container, dcb.CONTAINER_NAME = (lambda: None), "docker-controller-bot"
+		assert dcb.set_update_mode("h_local", "dcb", {}, "dgongut/docker-controller-bot:latest", "auto") == dcb.get_text(
+			"container_updates_maybe_the_bot")
+		assert dcb.set_update_mode("h_local", "dcb", {}, "dgongut/docker-controller-bot:latest", "ignore") is None
+		assert store.container_settings() == {"h_local": {"dcb": {"updates": "ignore"}}}
+	finally:
+		dcb.own_container, dcb.CONTAINER_NAME = original
+		store.forget_host_containers("h_local")
+		_restore_hosts()
+
+
+def test_info_says_what_a_new_version_does_and_a_tap_moves_it_on():
+	"""
+	One button that says how it is set and, tapped, sets the next: tell me,
+	update on its own, do not check. It carries the mode it sets, so a double
+	tap lands once.
+	"""
+	ref = dcb.make_ref("h_local", "abc12")
+	markup = dcb.info_markup(ref, True, False, ("auto", None, "ignore"))
+	assert harness.keyboard_callbacks(markup) == [f"confirmUpdate|{ref}", f"infoSetUpdates|i|{ref}", "cerrar"]
+	row = harness.keyboard_labels(markup)[1]
+	assert row.startswith("🤖") and dcb.get_text("button_updates_auto") in row, row
+	assert harness.keyboard_callbacks(dcb.info_markup(ref, False, False, (None, None, "auto")))[0] == f"infoSetUpdates|a|{ref}"
+	assert harness.keyboard_callbacks(dcb.info_markup(ref, False, False, ("ignore", None, None)))[0] == f"infoSetUpdates|n|{ref}"
+	labelled = harness.keyboard_labels(dcb.info_markup(ref, False, False, ("ignore", dcb.LABEL_IGNORE_CHECK_UPDATES, None)))
+	assert labelled[0].startswith("🏷️"), labelled
+	# An /info that could not be gathered has nothing to set.
+	assert harness.keyboard_callbacks(dcb.info_markup(ref, False, False, None)) == ["cerrar"]
+
+
+def test_tapping_in_info_goes_round_the_three_and_shows_it_in_place():
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	plex = _container("plex", "running", image="plex:latest")
+	owner = dcb.manager("h_local")
+	ref = dcb.make_ref("h_local", "abc12")
+	repainted, answered = [], []
+	originals = (dcb.find_container, dcb.edit_message_reply_markup_sync, dcb.answer_callback_quietly)
+	dcb.find_container = lambda reference: (owner, plex)
+	dcb.edit_message_reply_markup_sync = lambda chat_id, message_id, reply_markup=None: repainted.append(reply_markup)
+	dcb.answer_callback_quietly = lambda call_id, text=None, show_alert=False: answered.append((text, show_alert))
+	tap = lambda: callbacks.cb_infoSetUpdates(callback_registry.Context(
+		call=MagicMock(id="q"), chatId=1, messageId=2, containerId=ref, containerName="plex",
+		value=harness.keyboard_callbacks(repainted[-1] if repainted else dcb.live_info_markup(ref))[0].split("|")[1]))
+	try:
+		seen = []
+		for _ in range(3):
+			tap()
+			seen.append(store.container_update_mode("h_local", "plex"))
+		assert seen == ["auto", "ignore", None], seen
+		assert harness.keyboard_callbacks(repainted[-1]) == [f"infoSetUpdates|a|{ref}", f"infoSetNotifications|p|{ref}", "cerrar"]
+		assert answered[-1] == (None, False)
+		# The same button pressed twice before the repaint lands once.
+		callbacks.cb_infoSetUpdates(callback_registry.Context(
+			call=MagicMock(id="q"), chatId=1, messageId=2, containerId=ref, containerName="plex", value="a"))
+		callbacks.cb_infoSetUpdates(callback_registry.Context(
+			call=MagicMock(id="q"), chatId=1, messageId=2, containerId=ref, containerName="plex", value="a"))
+		assert store.container_update_mode("h_local", "plex") == "auto"
+
+		# Decided by a label: it says so, and nothing changes.
+		plex.labels = {dcb.LABEL_AUTO_UPDATE: ""}
+		callbacks.cb_infoSetUpdates(callback_registry.Context(
+			call=MagicMock(id="q"), chatId=1, messageId=2, containerId=ref, containerName="plex", value="i"))
+		assert answered[-1][1] is True and store.container_update_mode("h_local", "plex") == "auto", answered[-1]
+	finally:
+		dcb.find_container, dcb.edit_message_reply_markup_sync, dcb.answer_callback_quietly = originals
+		store.forget_host_containers("h_local")
+		_restore_hosts()
+
+
+def _container_list(*containers, host_id="h_local"):
+	return {"host": host_id, "page": 0, "several_hosts": False,
+			"items": dcb.container_list_items(containers)}
+
+
+def test_the_list_in_settings_shows_each_container_and_moves_it_on():
+	"""
+	One list for the three modes. Each button carries the mode it sets, never
+	"next": two taps, or two admins on the same list, land on the same answer
+	instead of going round twice.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	plex, proxy, ha = (_container(n, "running") for n in ("plex", "proxy", "homeassistant"))
+	ha.labels = {dcb.LABEL_AUTO_UPDATE: "", "other": "x"}
+	original = dcb.DockerManager.container_named
+	dcb.DockerManager.container_named = lambda self, name: {c.name: c for c in (plex, proxy, ha)}.get(name)
+	try:
+		store.set_container_update_mode("h_local", "proxy", "ignore")
+		data = _container_list(plex, proxy, ha)
+		assert data["items"][2][1] == {dcb.LABEL_AUTO_UPDATE: ""}, "guarda labels que no son suyas"
+		text, markup = dcb.build_settings_containers_list(data)
+		assert harness.keyboard_callbacks(markup)[:3] == [
+			"ctrToggle|h_local|0|a", "ctrToggle|h_local|1|n", "ctrToggle|h_local|2|i"]
+		labels = harness.keyboard_labels(markup)
+		assert labels[:3] == ["🔔 plex", "🚫 proxy", "🏷️🔄 homeassistant"], labels
+
+		assert dcb.toggle_in_container_list(data, 0, "auto") is None
+		assert dcb.toggle_in_container_list(data, 0, "auto") is None
+		assert store.container_update_mode("h_local", "plex") == "auto", "un segundo toque lo ha movido otra vez"
+		assert dcb.toggle_in_container_list(data, 0, "ignore") is None
+		assert store.container_update_mode("h_local", "plex") == "ignore"
+		assert dcb.toggle_in_container_list(data, 1, None) is None
+		assert store.container_update_mode("h_local", "proxy") is None
+		assert dcb.toggle_in_container_list(data, 2, "ignore") == dcb.get_text(
+			"container_updates_by_label", dcb.LABEL_AUTO_UPDATE)
+	finally:
+		dcb.DockerManager.container_named = original
+		store.forget_host_containers("h_local")
+		_restore_hosts()
+
+
+def test_the_per_container_screens_fit_and_keep_their_message():
+	"""The callbacks fit in 64 bytes and repaint in place, however long the names."""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	long_named = _container("x" * 200, "running")
+	try:
+		screens = [dcb.build_settings_containers_hosts([(HOST_FIXTURE[0], None, []), (HOST_FIXTURE[1], None, [])],
+													   ["h_local", "h_nas"])[1],
+				   dcb.build_settings_containers_list(_container_list(*([long_named] * 120)))[1],
+				   dcb.info_markup(dcb.make_ref("h_nas", "abc12"), True, True, (None, None, "auto"))]
+		for markup in screens:
+			for data in harness.keyboard_callbacks(markup):
+				assert len(data.encode()) <= 64, data
+				spec, _args = callback_registry.parse(data)
+				# /info's own buttons hand the message over, as they always have.
+				assert spec.keeps_message or spec.name in ("cerrar", "confirmUpdate", "run"), spec.name
+		# A long list goes a page at a time.
+		assert "ctrPage|h_local|1" in harness.keyboard_callbacks(screens[1])
+	finally:
+		_restore_hosts()
+
+
+def test_one_pass_updates_everything_on_its_own_in_one_batch():
+	"""
+	Four containers on one host each left their own "✅ Updated", a minute
+	apart. They go together now, as if ticked in /updateall: one call, across
+	hosts, to the notification channel.
+	"""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	listed = {"h_local": [], "h_nas": []}
+	for host_id, names in (("h_local", ("dropbot",)), ("h_nas", ("web", "donate", "rosario"))):
+		for name in names:
+			container = _container(name, "running", image=f"{name}:latest")
+			container.image.id = "sha256:old"
+			listed[host_id].append(container)
+	listed["h_nas"][0].labels = {dcb.LABEL_AUTO_UPDATE: ""}
+	for host_id, name in (("h_local", "dropbot"), ("h_nas", "donate"), ("h_nas", "rosario")):
+		store.set_container_update_mode(host_id, name, "auto")
+	batches, counted = [], []
+	everyone = {c.name: c for containers in listed.values() for c in containers}
+	original = (dcb.DockerManager.list_containers, dcb.update_containers, dcb.find_live_container,
+				dcb.runs_latest_image, dcb.DockerUpdateMonitor._announce, dcb.count_usage)
+	dcb.DockerManager.list_containers = lambda self, comando="": listed[self.host_id]
+	dcb.update_containers = lambda targets, send=None, **kw: batches.append(([n for _, n in targets], send, kw))
+	everyone_now = dict(everyone)
+	del everyone_now["rosario"]   # removed meanwhile
+	dcb.find_live_container = lambda ref, name: (dcb.manager(dcb.ref_host(ref)), everyone_now.get(name))
+	dcb.runs_latest_image = lambda ref, name: False
+	dcb.DockerUpdateMonitor._announce = lambda self, found, new: None
+	dcb.count_usage = counted.append
+	try:
+		for owner in dcb.managers():
+			owner.client.api.pull = lambda repo, tag=None, **kwargs: []
+			owner.client.images.get = lambda reference: MagicMock(id="sha256:new")
+		dcb.DockerUpdateMonitor()._check_fleet(cold_cache=False)
+		# What is already current by then is the batch's to leave out, quietly.
+		assert batches == [(["dropbot", "web", "donate"], dcb.auto_update_send, {"report_up_to_date": False})], batches
+		assert counted.count("auto_label_update") == 1 and counted.count("auto_bot_update") == 2, counted
+	finally:
+		(dcb.DockerManager.list_containers, dcb.update_containers, dcb.find_live_container,
+			dcb.runs_latest_image, dcb.DockerUpdateMonitor._announce, dcb.count_usage) = original
+		for host_id in ("h_local", "h_nas"):
+			store.forget_host_containers(host_id)
+			for name in everyone:
+				dcb.save_container_update_status(f"{name}:latest", name, None, host_id)
+		_restore_hosts()
+
+
+def test_the_automatic_updates_ask_about_the_mute_on_every_message():
+	"""A batch takes minutes, and a mute can start or end halfway through it."""
+	sent = []
+	original = dcb.send_message_to_notification_channel
+	dcb.send_message_to_notification_channel = lambda message=None, **kw: sent.append(message) or "sent"
+	try:
+		store.state_set("mute_until", time.time() + 60)
+		assert dcb.auto_update_send("one") is None
+		store.state_set("mute_until", 0)
+		assert dcb.auto_update_send("two") == "sent"
+		assert sent == ["two"], sent
+	finally:
+		dcb.send_message_to_notification_channel = original
+		store.state_set("mute_until", 0)
+
+
+def test_one_update_failing_in_a_step_by_step_batch_does_not_stop_the_rest():
+	"""
+	A host that stops answering halfway through raised out of the batch, and
+	everything after it —the bot's own update included— was left undone.
+	"""
+	calls, sent, _edited, _deleted, restore = _batch_stubs({}, extended=True, own=("bot",))
+	perform = dcb.perform_container_update
+
+	def failing(ref, name, tag=None, send_fn=None, hold_events=False):
+		if name == "nginx":
+			raise RuntimeError("host gone")
+		return perform(ref, name, tag=tag, send_fn=send_fn, hold_events=hold_events)
+	dcb.perform_container_update = failing
+	try:
+		dcb.update_containers(_targets("nginx", "plex", "bot"))
+		assert [c[0] for c in calls] == ["plex", "bot"], calls
+		assert any(dcb.get_text("updated_one_failed") in message for message in sent), sent
+	finally:
+		restore()
+
+
+def test_the_settings_of_a_container_gone_for_a_month_are_forgotten_and_said():
+	"""
+	What a label now decides goes quietly, the rest after the grace period and
+	with a message. A host that does not answer keeps everything.
+	"""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	plex, proxy = _container("plex", "running"), _container("proxy", "running")
+	proxy.labels = {dcb.LABEL_IGNORE_CHECK_UPDATES: ""}
+	store.set_container_update_mode("h_local", "plex", "auto")
+	store.set_container_update_mode("h_local", "proxy", "auto")
+	store.set_container_update_mode("h_local", "gone", "ignore")
+	store.set_container_update_mode("h_nas", "radarr", "auto")
+	sent = []
+	original = dcb.send_message_to_notification_channel
+	dcb.send_message_to_notification_channel = lambda message=None, **kw: sent.append(message)
+	month = dcb.CONTAINER_SETTINGS_GRACE_DAYS * 24 * 60 * 60
+	try:
+		sections = [(HOST_FIXTURE[0], None, [plex, proxy])]
+		assert dcb.forget_gone_container_settings(sections, now=0) == []
+		assert store.container_update_mode("h_local", "proxy") is None, "la label manda y el ajuste seguía debajo"
+		assert sent == []
+		assert dcb.forget_gone_container_settings(sections, now=month) == [("h_local", "gone")]
+		assert len(sent) == 1 and "gone" in sent[0], sent
+		assert store.container_update_mode("h_local", "plex") == "auto"
+		assert store.container_update_mode("h_nas", "radarr") == "auto", "un host que no respondía ha perdido sus ajustes"
+	finally:
+		dcb.send_message_to_notification_channel = original
+		for host_id in ("h_local", "h_nas"):
+			store.forget_host_containers(host_id)
+		store.state_set("containers_absent", {})
+		_restore_hosts()
+
+
+def test_removing_a_host_or_deleting_from_the_bot_forgets_the_settings():
+	import host_registry
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	try:
+		store.set_container_update_mode("h_nas", "plex", "auto")
+		store.set_container_update_mode("h_local", "plex", "auto")
+		assert "📦" in dcb.build_settings_host_remove("h_nas")[0]
+		assert host_registry.remove_host("h_nas") is True
+		assert store.container_settings() == {"h_local": {"plex": {"updates": "auto"}}}
+
+		dcb.save_container_update_status("plex:latest", "plex", True, "h_local")
+		owner = dcb.manager("h_local")
+		owner.client.containers.get = lambda _id: _container("plex", "exited")
+		assert dcb.get_text("confirm_delete_settings") in _sent_by(dcb.confirm_delete, dcb.make_ref("h_local", "abc12"), "plex")
+		owner.delete("abc12", "plex")
+		assert store.container_settings() == {}
+		assert dcb.read_container_update_status("plex:latest", "plex", "h_local") is None
+	finally:
+		store.forget_host_containers("h_local")
+		_restore_hosts()
+
+
+def _sent_by(function, *args):
+	"""The text `function` sends, which it does rather than return it."""
+	sent = []
+	original = dcb.send_message
+	dcb.send_message = lambda message="", **kw: sent.append(message)
+	try:
+		function(*args)
+	finally:
+		dcb.send_message = original
+	return "\n".join(sent)
+
+
+def test_an_automatic_batch_leaves_out_what_is_already_current_without_a_word():
+	"""A summary saying "already up to date" about something nobody asked for is noise."""
+	calls, sent, _edited, _deleted, restore = _batch_stubs({}, current=("plex",))
+	try:
+		dcb.update_containers(_targets("nginx", "plex"), report_up_to_date=False)
+		assert [c[0] for c in calls] == ["nginx"], calls
+		assert not any("plex" in message for message in sent), sent
+		sent.clear()
+		dcb.update_containers(_targets("nginx", "plex"))
+		assert any("plex" in message for message in sent), "por /updateall sí se dice"
+	finally:
+		restore()
+
+
+def test_what_an_update_warns_about_on_its_own_goes_where_its_batch_reports():
+	"""
+	The old container left behind went to the chat even from an automatic
+	update, and even while muted: it took the chat of a progress message that
+	a summarised batch never has.
+	"""
+	calls, sent, _edited, _deleted, restore = _batch_stubs({})
+	warned = []
+
+	def perform(ref, name, tag=None, send_fn=None, hold_events=False):
+		dcb.update_notify("h_local", None)("left behind")
+		return dcb.UpdateOutcome(True, "")
+	dcb.perform_container_update = perform
+	try:
+		dcb.update_containers(_targets("nginx"), send=warned.append)
+		assert any("left behind" in text for text in warned), warned
+		assert not any("left behind" in (text or "") for text in sent), sent
+		# Outside a batch that says where, it is the chat, as it was.
+		dcb.update_notify("h_local", None)("left behind")
+		assert any("left behind" in (text or "") for text in sent), sent
+	finally:
+		restore()
+
+
+def test_a_tap_on_a_list_the_message_no_longer_shows_lands_on_nothing():
+	"""
+	The buttons carried only a position, and the option and the host came from
+	whatever list the message held by then: a late tap, or a second admin,
+	toggled whatever was in that place of another list.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	answered = []
+	original = (dcb.answer_callback_quietly, dcb.edit_message_reply_markup)
+	dcb.answer_callback_quietly = lambda call_id, text=None, show_alert=False: answered.append((text, show_alert))
+	dcb.edit_message_reply_markup = lambda *a, **kw: answered.append("keyboard removed")
+	try:
+		data = _container_list(_container("plex", "running"))
+		dcb.save_container_list(1, 2, data)
+		press = lambda field, index="0": callback_registry.Context(
+			call=MagicMock(id="q"), chatId=1, messageId=2, field=field, containerIdx=index, value="a")
+		callbacks.cb_ctrToggle(press("h_nas"))   # from another host's list
+		callbacks.cb_ctrToggle(press("h_local", index="5"))   # past its end
+		assert store.container_settings() == {}
+		assert answered == [(dcb.get_text("settings_containers_expired"), True)] * 2, answered
+		# Close takes the list with it.
+		callbacks.cb_cerrar(callback_registry.Context(call=MagicMock(id="q"), chatId=1, messageId=2))
+		assert dcb.load_container_list(1, 2, "h_local") is None
+	finally:
+		dcb.answer_callback_quietly, dcb.edit_message_reply_markup = original
+		dcb.clear_container_list(1, 2)
+		_restore_hosts()
+
+
+def test_the_host_picker_offers_only_hosts_with_something_to_list():
+	"""
+	A host that answers with no containers opened an empty list; one that does
+	not answer has its kept settings named, with or without a picker.
+	"""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	edited = []
+	original = (dcb.hosts_with_containers, dcb.edit_message_text)
+	dcb.edit_message_text = lambda text, chat_id, message_id, reply_markup=None, **kw: edited.append((text, reply_markup))
+	try:
+		store.set_container_update_mode("h_nas", "radarr", "auto")
+		dcb.hosts_with_containers = lambda: [(HOST_FIXTURE[0], None, [_container("plex", "running")]),
+											 (HOST_FIXTURE[1], None, [])]
+		dcb.show_settings_containers(1, 2)
+		text, markup = edited[-1]
+		assert "ctrToggle|h_local|0|a" in harness.keyboard_callbacks(markup), "no ha ido directo a la única lista"
+		assert "nas" not in text, "nas responde: sus ajustes no están lejos"
+
+		dcb.hosts_with_containers = lambda: [(HOST_FIXTURE[0], None, [_container("plex", "running")])]
+		dcb.show_settings_containers(1, 2)
+		text, markup = edited[-1]
+		assert "<b>nas</b>" in text and "(1)" in text, text
+
+		dcb.hosts_with_containers = lambda: []
+		dcb.show_settings_containers(1, 2)
+		text, markup = edited[-1]
+		assert dcb.get_text("settings_containers_pick_host") not in text, text
+		assert harness.keyboard_callbacks(markup) == ["settingsUpdates", "cerrar"]
+	finally:
+		dcb.hosts_with_containers, dcb.edit_message_text = original
+		dcb.clear_container_list(1, 2)
+		store.forget_host_containers("h_nas")
+		_restore_hosts()
+
+
+def test_going_back_from_the_choices_keeps_the_update_button_info_offered():
+	"""
+	/info reads the cache whether checks are on or not; the repaint asked
+	update_available, which says no while they are off, and the button went.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	plex = _container("plex", "running", image="plex:latest")
+	ref = dcb.make_ref("h_local", "abc12")
+	original = dcb.find_container
+	dcb.find_container = lambda reference: (dcb.manager("h_local"), plex)
+	was_checking = store.get("bot.check_updates")
+	try:
+		store.set("bot.check_updates", False)
+		dcb.save_container_update_status("plex:latest", "plex", True, "h_local")
+		assert f"confirmUpdate|{ref}" in harness.keyboard_callbacks(dcb.live_info_markup(ref))
+		store.set_container_update_mode("h_local", "plex", "ignore")
+		assert f"confirmUpdate|{ref}" not in harness.keyboard_callbacks(dcb.live_info_markup(ref))
+	finally:
+		dcb.find_container = original
+		store.set("bot.check_updates", was_checking)
+		store.forget_host_containers("h_local")
+		dcb.save_container_update_status("plex:latest", "plex", None, "h_local")
+		_restore_hosts()
+
+
+def test_an_alert_is_cut_to_what_telegram_takes():
+	"""Over 200 characters Telegram refuses it, and the tap shows nothing."""
+	answered = []
+	original = (dcb.edit_message_reply_markup_sync, dcb.answer_callback_quietly)
+	dcb.edit_message_reply_markup_sync = lambda *a, **kw: None
+	dcb.answer_callback_quietly = lambda call_id, text=None, show_alert=False: answered.append(text)
+	try:
+		dcb.repaint_markup("q", 1, 2, None, alert=dcb.get_text("container_updates_by_label", "x" * 300))
+		assert len(answered[0]) == dcb.ALERT_MAX_LENGTH and answered[0].endswith("…"), answered
+	finally:
+		dcb.edit_message_reply_markup_sync, dcb.answer_callback_quietly = original
+
+
+def test_the_first_check_is_remembered_once_it_has_written_something():
+	"""
+	With the cache emptied of its last entry, the next pass took itself for the
+	first and saved real news as announced. A pass that checked nothing —every
+	host down— does not count.
+	"""
+	class Waited(Exception):
+		pass
+
+	def wait():
+		raise Waited()
+
+	original = (dcb.DockerUpdateMonitor._check_fleet, dcb.wait_for_next_update_check)
+	was_checking = store.get("bot.check_updates")
+	saved_state = store.state_get("update_check_done")
+	seen = []
+
+	def one_pass(writes, decided=0, failed=0):
+		def check(self, cold_cache):
+			seen.append(cold_cache)
+			self._decided, self._failed = decided, failed
+			if writes:
+				dcb.save_container_update_status("plex:latest", "plex", False, "h_local")
+		dcb.DockerUpdateMonitor._check_fleet = check
+		try:
+			dcb.DockerUpdateMonitor().detectar_actualizaciones()
+		except Waited:
+			pass
+
+	dcb.wait_for_next_update_check = wait
+	store.set("bot.check_updates", True)
+	entries = store.update_entries()
+	decided = []
+	try:
+		store.clear_update_cache()
+		store.state_set("update_check_done", False)
+		one_pass(writes=False)
+		assert store.update_check_done() is False
+		# Something ignored, but a pull failed: still the first.
+		one_pass(writes=False, decided=1, failed=1)
+		assert store.update_check_done() is False
+		# Everything ignored or stopped, and nothing failed: done, though the
+		# cache has nothing to show for it.
+		one_pass(writes=False, decided=2)
+		assert store.update_check_done() is True
+		store.state_set("update_check_done", False)
+		one_pass(writes=True)
+		dcb.save_container_update_status("plex:latest", "plex", None, "h_local")
+		one_pass(writes=False)
+		assert seen == [True, True, True, True, False], seen
+	finally:
+		dcb.DockerUpdateMonitor._check_fleet, dcb.wait_for_next_update_check = original
+		store.set("bot.check_updates", was_checking)
+		store.state_set("update_check_done", saved_state)
+		for key, entry in entries.items():
+			host_id, name = key.split(":", 1)
+			store.set_update_status(host_id, name, entry.get("image"), entry.get("update"),
+									checked_at=entry.get("checked"), versions=entry.get("versions"))
+
+
+def test_info_shows_the_last_check_only_while_the_container_is_checked():
+	checked = formatting.render_container_info(_info(last_check_seconds=600))
+	assert i18n.get_text("info_last_check") in checked and i18n.get_text("info_bot") in checked, checked
+	ignored = formatting.render_container_info(_info(last_check_seconds=600, update_mode="ignore"))
+	# Nothing left under "Bot", so no heading for it either.
+	assert i18n.get_text("info_last_check") not in ignored and i18n.get_text("info_bot") not in ignored, ignored
+
+
+def test_telemetry_counts_what_was_chosen_in_the_bot_apart_from_the_labels():
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	labelled = _container("ha", "running")
+	labelled.labels = {dcb.LABEL_AUTO_UPDATE: ""}
+	chosen, ignored = _container("plex", "running"), _container("proxy", "running")
+	store.set_container_update_mode("h_local", "plex", "auto")
+	store.set_container_update_mode("h_local", "proxy", "ignore")
+	# Under a label, a value kept in the bot counts for nothing.
+	store.set_container_update_mode("h_local", "ha", "ignore")
+	original = dcb.hosts_with_containers
+	dcb.hosts_with_containers = lambda: [(HOST_FIXTURE[0], None, [labelled, chosen, ignored])]
+	try:
+		metrics = dcb.collect_telemetry_metrics()
+		assert (metrics["containers_auto_update"], metrics["containers_ignore_updates"]) == (1, 0), metrics
+		assert (metrics["containers_auto_update_bot"], metrics["containers_ignore_updates_bot"]) == (1, 1), metrics
+	finally:
+		dcb.hosts_with_containers = original
+		store.forget_host_containers("h_local")
+		_restore_hosts()
+
+
+def test_what_is_no_longer_set_to_update_on_its_own_is_left_alone():
+	"""
+	A tap from "tell me" to "do not check" goes through "update on its own".
+	If the check passed by just then, the batch at the end of the pass asks
+	again and leaves it alone.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	proxy = _container("proxy", "running")
+	batches = []
+	original = (dcb.find_live_container, dcb.update_containers)
+	dcb.find_live_container = lambda ref, name: (dcb.manager("h_local"), proxy)
+	dcb.update_containers = lambda targets, **kw: batches.append(targets)
+	try:
+		store.set_container_update_mode("h_local", "proxy", "ignore")
+		dcb.DockerUpdateMonitor()._auto_update([("h_local", dcb.make_ref("h_local", "abc12"), "proxy", None)])
+		assert batches == [], batches
+		store.set_container_update_mode("h_local", "proxy", "auto")
+		dcb.DockerUpdateMonitor()._auto_update([("h_local", dcb.make_ref("h_local", "abc12"), "proxy", None)])
+		assert [[name for _, name in targets] for targets in batches] == [["proxy"]], batches
+	finally:
+		dcb.find_live_container, dcb.update_containers = original
+		store.forget_host_containers("h_local")
+		_restore_hosts()
+
+
+# --- Cambiar la URL de un host -----------------------------------------------
+
+def _url_flow_stubs():
+	"""Captures what the URL change sends and edits, and returns the undo."""
+	sent, edited = [], []
+	original = (dcb.send_message, dcb.edit_message_text, dcb.host_registry.probe_new_url)
+	dcb.send_message = lambda message="", reply_markup=None, **kw: sent.append((message, reply_markup)) or MagicMock()
+	dcb.edit_message_text = lambda text, chat_id, message_id, reply_markup=None, **kw: edited.append((text, reply_markup))
+
+	def undo():
+		dcb.send_message, dcb.edit_message_text, dcb.host_registry.probe_new_url = original
+	return sent, edited, undo
+
+
+def test_a_remote_host_offers_to_change_its_url_and_the_local_one_does_not():
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	try:
+		assert "settingsHostUrl|h_nas" in harness.keyboard_callbacks(dcb.build_settings_host("h_nas")[1])
+		assert not any(c.startswith("settingsHostUrl") for c in harness.keyboard_callbacks(dcb.build_settings_host("h_local")[1]))
+	finally:
+		_restore_hosts()
+
+
+def test_the_same_docker_by_another_url_changes_straight_away():
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	sent, _edited, undo = _url_flow_stubs()
+	dcb.host_registry.probe_new_url = lambda host_id, url: True
+	store.set_container_update_mode("h_nas", "plex", "auto")
+	dcb.save_container_update_status("plex:latest", "plex", True, "h_nas")
+	try:
+		dcb.receive_host_url(4405089, "h_nas", "ssh://admin@nas")
+		assert store.get("hosts")[1]["url"] == "ssh://admin@nas" and store.get("hosts")[1]["id"] == "h_nas"
+		text, markup = sent[-1]
+		assert dcb.get_text("settings_host_url_changed", dcb.host_alias("h_nas"), "ssh://admin@nas") in text, text
+		assert "settingsHostUrl|h_nas" in harness.keyboard_callbacks(markup), "no ha vuelto a la pantalla del host"
+		# Same machine: everything kept, the cache included.
+		assert store.container_update_mode("h_nas", "plex") == "auto"
+		assert dcb.read_container_update_status("plex:latest", "plex", "h_nas") is True
+	finally:
+		undo()
+		store.forget_host_containers("h_nas")
+		dcb.save_container_update_status("plex:latest", "plex", None, "h_nas")
+		_restore_hosts()
+
+
+def test_another_docker_is_changed_only_once_confirmed_and_checked_again():
+	"""
+	Another machine, or one that cannot be compared, is asked about first: its
+	settings and schedules would apply to whatever is called the same there.
+	The URL waits in the admin's pending state, tied to the message that asks,
+	and is checked again on confirming: a minute later it may not answer, or be
+	another host already.
+	"""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	sent, edited, undo = _url_flow_stubs()
+	answered = []
+	numbers = iter(range(100, 200))
+
+	class Sent:
+		def __init__(self):
+			self.message_id = next(numbers)
+	dcb.send_message = lambda message="", reply_markup=None, **kw: sent.append((message, reply_markup)) or Sent()
+	original_answer = dcb.answer_callback_quietly
+	dcb.answer_callback_quietly = lambda call_id, text=None, show_alert=False: answered.append((text, show_alert))
+	chat = dcb.get_reply_chat_id()
+	press = lambda name, message, user=4405089: getattr(callbacks, name)(callback_registry.Context(
+		call=MagicMock(id="q"), userId=user, chatId=chat, messageId=message, value="h_nas"))
+	dcb.host_registry.probe_new_url = lambda host_id, url: False
+	dcb.save_container_update_status("plex:latest", "plex", True, "h_nas")
+	try:
+		dcb.receive_host_url(4405089, "h_nas", "tcp://a:2375")
+		first = 100
+		text, markup = sent[-1]
+		assert dcb.get_text("settings_host_url_other_daemon", dcb.host_alias("h_nas"), "tcp://a:2375") in text, text
+		assert harness.keyboard_callbacks(markup) == ["settingsHostUrlConfirm|h_nas", "settingsHostUrlCancel|h_nas"]
+		assert store.get("hosts")[1]["url"] == "tcp://nas:2375", "lo ha cambiado sin confirmar"
+
+		# Asked again: the first question no longer confirms anything, and
+		# certainly not the URL the second one shows.
+		dcb.receive_host_url(4405089, "h_nas", "tcp://b:2375")
+		press("cb_settingsHostUrlConfirm", first)
+		assert store.get("hosts")[1]["url"] == "tcp://nas:2375" and answered[-1][1] is True
+		# Another admin's tap only says so, and leaves the question alone.
+		edits = len(edited)
+		press("cb_settingsHostUrlConfirm", 101, user=999)
+		assert len(edited) == edits and answered[-1][1] is True
+		press("cb_settingsHostUrlConfirm", 101)
+		assert store.get("hosts")[1]["url"] == "tcp://b:2375"
+		assert dcb.read_container_update_status("plex:latest", "plex", "h_nas") is None, "la caché era de otra máquina"
+		assert "settingsHostUrl|h_nas" in harness.keyboard_callbacks(edited[-1][1])
+		# Pressed again, there is nothing pending any more.
+		press("cb_settingsHostUrlConfirm", 101)
+		assert answered[-1] == (dcb.alert_text(dcb.get_text("settings_host_url_expired")), True)
+
+		# Checked again on confirming: by then it is refused, and nothing changes.
+		dcb.host_registry.probe_new_url = lambda host_id, url: None
+		dcb.receive_host_url(4405089, "h_nas", "tcp://otra:2375")
+		assert dcb.get_text("settings_host_url_unknown_daemon", dcb.host_alias("h_nas"), "tcp://otra:2375") in sent[-1][0]
+
+		def now_refused(host_id, url):
+			raise dcb.host_registry.HostRejected("duplicate")
+		dcb.host_registry.probe_new_url = now_refused
+		press("cb_settingsHostUrlConfirm", 102)
+		assert store.get("hosts")[1]["url"] == "tcp://b:2375"
+		assert dcb.get_text("settings_host_duplicate", "tcp://otra:2375") in edited[-1][0]
+
+		# Cancelled: nothing left to confirm.
+		dcb.host_registry.probe_new_url = lambda host_id, url: None
+		dcb.receive_host_url(4405089, "h_nas", "tcp://otra:2375")
+		press("cb_settingsHostUrlCancel", 103)
+		press("cb_settingsHostUrlConfirm", 103)
+		assert store.get("hosts")[1]["url"] == "tcp://b:2375"
+	finally:
+		undo()
+		dcb.answer_callback_quietly = original_answer
+		dcb.save_container_update_status("plex:latest", "plex", None, "h_nas")
+		_restore_hosts()
+
+
+def test_a_refused_url_says_why_and_leaves_the_host_as_it_was():
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	sent, _edited, undo = _url_flow_stubs()
+
+	def unreachable(host_id, url):
+		raise dcb.host_registry.HostUnavailable(host_id, "connection refused")
+	try:
+		for raw, probe, expected in (
+				("no es una url", None, dcb.get_text("settings_host_invalid")),
+				("tcp://nas:2375", "same", dcb.get_text("settings_host_url_same")),
+				("tcp://apagado:2375", unreachable, dcb.get_text("settings_host_unreachable", "tcp://apagado:2375", "connection refused"))):
+			if probe == "same":
+				def probe(host_id, url):
+					raise dcb.host_registry.HostRejected("same")
+			if probe:
+				dcb.host_registry.probe_new_url = probe
+			dcb.receive_host_url(4405089, "h_nas", raw)
+			assert expected in sent[-1][0], (raw, sent[-1][0])
+			assert store.get("hosts")[1]["url"] == "tcp://nas:2375"
+	finally:
+		undo()
+		_restore_hosts()
+
+
+def test_a_host_with_a_new_url_gets_a_new_event_stream():
+	"""It keeps its id, and its stream would have stayed on the old daemon."""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	started, stopped = [], []
+
+	class Monitor:
+		def __init__(self, host_id):
+			self.host_id, self.thread, self.alias = host_id, None, host_id
+		def demonio_event(self):
+			started.append(self.host_id)
+		def stop(self):
+			stopped.append(self.host_id)
+
+	original = (dcb.DockerEventMonitor, dcb.EventMonitorSupervisor._check_hosts)
+	dcb.DockerEventMonitor = Monitor
+	dcb.EventMonitorSupervisor._check_hosts = lambda self, monitors: None
+	try:
+		supervisor = dcb.EventMonitorSupervisor()
+		supervisor.reconcile()
+		assert sorted(started) == ["h_local", "h_nas"] and not stopped
+		supervisor.reconcile()
+		assert len(started) == 2, "sin cambios no se reinicia nada"
+		dcb.host_registry.change_url("h_nas", "tcp://192.168.1.20:2375")
+		supervisor.reconcile()
+		assert stopped == ["h_nas"] and started.count("h_nas") == 2, (started, stopped)
+	finally:
+		dcb.DockerEventMonitor, dcb.EventMonitorSupervisor._check_hosts = original
+		_restore_hosts()
+
+
+def test_a_pass_that_decided_something_is_no_longer_the_first():
+	"""
+	Waiting for the cache to have an entry left an install whose containers
+	were all ignored cold for good: the first update after one came back was
+	saved as announced without a word. A pass that could decide nothing —every
+	pull failing— is still the first.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	ignored = _container("proxy", "running")
+	failing = _container("plex", "running")
+	failing.image.id = "sha256:old"
+	owner = MagicMock()
+	owner.client.api.pull.side_effect = Exception("429 Too Many Requests")
+	try:
+		store.set_container_update_mode("h_local", "proxy", "ignore")
+		monitor = dcb.DockerUpdateMonitor()
+		monitor._check_host(HOST_FIXTURE[0], owner, True, [failing])
+		assert monitor._decided == 0, "un pull fallido no es una decisión"
+		monitor._check_host(HOST_FIXTURE[0], owner, True, [ignored])
+		assert monitor._decided == 1
+	finally:
+		store.forget_host_containers("h_local")
+		_restore_hosts()
+
+
+def test_extended_messages_say_each_automatic_update_right_before_it():
+	"""
+	All of them up front, and for one the batch then skipped: it read as
+	"updating" for something that never was.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	a, b, done = (_container(n, "running") for n in ("a", "b", "done"))
+	events, counted = [], []
+	everyone = {c.name: c for c in (a, b, done)}
+	original = (dcb.find_live_container, dcb.runs_latest_image, dcb.update_containers,
+				dcb.auto_update_send, dcb.count_usage)
+	dcb.find_live_container = lambda ref, name: (dcb.manager("h_local"), everyone[name])
+	dcb.runs_latest_image = lambda ref, name: name == "done"
+	dcb.update_containers = lambda targets, **kw: events.append(("update", [n for _, n in targets]))
+	dcb.auto_update_send = lambda message: events.append(("said", message.split("<b>")[-1].split("</b>")[0]))
+	dcb.count_usage = counted.append
+	was = store.get("bot.extended_messages")
+	try:
+		for name in everyone:
+			store.set_container_update_mode("h_local", name, "auto")
+		store.set("bot.extended_messages", True)
+		dcb.DockerUpdateMonitor()._auto_update([("h_local", dcb.make_ref("h_local", "abc12"), n, None)
+												for n in ("a", "done", "b")])
+		assert events == [("said", "a"), ("update", ["a"]), ("said", "b"), ("update", ["b"])], events
+		assert counted == ["auto_bot_update", "auto_bot_update"], "contó lo que ya estaba al día"
+	finally:
+		(dcb.find_live_container, dcb.runs_latest_image, dcb.update_containers,
+			dcb.auto_update_send, dcb.count_usage) = original
+		store.set("bot.extended_messages", was)
+		store.forget_host_containers("h_local")
+		_restore_hosts()
+
+
+def test_what_might_be_the_bot_rotates_past_the_refused_auto():
+	"""
+	Every tap proposed "update on its own", which is refused there, and "do
+	not check" could never be reached.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	original = dcb.own_container
+	dcb.own_container = lambda: None
+	image = "dgongut/docker-controller-bot:latest"
+	try:
+		assert dcb.next_update_mode("h_local", None, image) == "ignore"
+		assert dcb.next_update_mode("h_local", "ignore", image) is None
+		assert dcb.next_update_mode("h_local", None, "plex:latest") == "auto"
+		bot = _container("dcb", "running", image=image)
+		data = _container_list(bot)
+		assert harness.keyboard_callbacks(dcb.build_settings_containers_list(data)[1])[0] == "ctrToggle|h_local|0|i"
+	finally:
+		dcb.own_container = original
+		_restore_hosts()
+
+
+def test_info_text_and_buttons_agree_after_a_tap_and_the_name_follows_the_container():
+	"""
+	The text kept offering the update the button no longer did. And the
+	reference the buttons were repainted with was not under the message's
+	name, so after one more recreation the next press said it did not exist.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	plex = _container("plex", "running", image="plex:latest")
+	owner = dcb.manager("h_local")
+	ref = dcb.make_ref("h_local", "new12")
+	edited, answered = [], []
+	original = (dcb.find_container, dcb.edit_message_text, dcb.answer_callback_quietly)
+	dcb.find_container = lambda reference: (owner, plex)
+	dcb.edit_message_text = lambda text, chat_id, message_id, reply_markup=None, **kw: edited.append((text, reply_markup))
+	dcb.answer_callback_quietly = lambda call_id, text=None, show_alert=False: answered.append(text)
+	try:
+		dcb.save_container_update_status("plex:latest", "plex", True, "h_local", ("1.0", "2.0"))
+		dcb.write_cache_item(dcb._info_key(1, 2), _info(has_update=True, update_versions=("1.0", "2.0")))
+		callbacks.cb_infoSetUpdates(callback_registry.Context(
+			call=MagicMock(id="q"), chatId=1, messageId=2, containerId=ref, containerName="plex", value="i"))
+		text, markup = edited[-1]
+		assert i18n.get_text("info_update_available") not in text, "el texto sigue ofreciendo la actualización"
+		assert f"confirmUpdate|{ref}" not in harness.keyboard_callbacks(markup)
+		assert dcb.load_container_name(1, 2, ref) == "plex", "la referencia nueva no está bajo el nombre"
+		callbacks.cb_cerrar(callback_registry.Context(call=MagicMock(id="q"), chatId=1, messageId=2))
+		assert dcb.read_cache_item(dcb._info_key(1, 2)) is None
+	finally:
+		dcb.find_container, dcb.edit_message_text, dcb.answer_callback_quietly = original
+		store.forget_host_containers("h_local")
+		dcb.save_container_update_status("plex:latest", "plex", None, "h_local")
+		_restore_hosts()
+
+
+def test_what_info_gathered_draws_the_same_after_being_kept():
+	"""It goes through the cache as JSON: tuples come back as lists."""
+	info = _info(has_update=True, update_versions=("1.0", "2.0"), schedules=[("noche", "0 4 * * *")],
+				 networks=[("bridge", "172.17.0.2")], ports=["8080 → 80/tcp"], mounts=[("data", "/data", True)],
+				 last_check_seconds=600, stats={"cpu": 1.5, "memory": 1024, "memory_limit": 4096})
+	kept = json.loads(json.dumps(info))
+	assert formatting.render_container_info(kept) == formatting.render_container_info(info)
+
+
+def test_a_tap_on_a_container_gone_or_labelled_since_the_list_stores_nothing():
+	"""
+	The list can be open a while. A tap stored a setting for a container
+	removed since —and its cleanup announced it a month later—, or one a label
+	overrode, while the button said otherwise.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	plex, gone = _container("plex", "running"), _container("gone", "running")
+	data = _container_list(plex, gone)
+	live = {"plex": plex}
+	original = dcb.DockerManager.container_named
+	dcb.DockerManager.container_named = lambda self, name: live.get(name)
+	try:
+		refused = dcb.toggle_in_container_list(data, 1, "auto")
+		assert refused and "<" not in refused and "gone" in refused, refused
+		relabelled = _container("plex", "running")
+		relabelled.labels = {dcb.LABEL_IGNORE_CHECK_UPDATES: ""}
+		live["plex"] = relabelled
+		assert dcb.toggle_in_container_list(data, 0, "auto") == dcb.get_text(
+			"container_updates_by_label", dcb.LABEL_IGNORE_CHECK_UPDATES)
+		assert store.container_settings() == {}
+		labels = harness.keyboard_labels(dcb.build_settings_containers_list(data)[1])
+		assert labels[0] == "🏷️🚫 plex", "el botón no enseña lo que hay ahora"
+	finally:
+		dcb.DockerManager.container_named = original
+		_restore_hosts()
+
+
+def test_a_host_paused_since_the_picker_is_not_asked_for_its_list():
+	"""The pause promises it is left alone, and over ssh a list is a process kept open."""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	shown, listed = [], []
+	original = (dcb.show_settings_containers, dcb.show_settings_containers_list)
+	dcb.show_settings_containers = lambda chat_id, message_id, kind="updates": shown.append("picker")
+	dcb.show_settings_containers_list = lambda *a, **kw: listed.append(a)
+	try:
+		dcb.host_registry.set_paused("h_nas", True)
+		callbacks.cb_ctrHost(callback_registry.Context(call=MagicMock(id="q"), chatId=1, messageId=2,
+													   field="updates", value="h_nas"))
+		assert shown == ["picker"] and listed == []
+	finally:
+		dcb.show_settings_containers, dcb.show_settings_containers_list = original
+		_restore_hosts()
+
+
+def test_going_back_to_the_update_settings_retires_the_list():
+	"""A tap still on its way landed on the list and painted its keyboard under another screen."""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	original = dcb.render_settings
+	dcb.render_settings = lambda *a, **kw: None
+	try:
+		dcb.save_container_list(1, 2, _container_list(_container("plex", "running")))
+		callbacks.cb_settingsUpdates(callback_registry.Context(call=MagicMock(id="q"), chatId=1, messageId=2))
+		assert dcb.load_container_list(1, 2, "h_local") is None
+	finally:
+		dcb.render_settings = original
+		_restore_hosts()
+
+
+def test_settings_forgotten_for_being_gone_take_their_cache_and_are_said_in_pieces():
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	sent = []
+	original = dcb.send_message_to_notification_channel
+	dcb.send_message_to_notification_channel = lambda message=None, **kw: sent.append(message)
+	month = dcb.CONTAINER_SETTINGS_GRACE_DAYS * 24 * 60 * 60
+	names = [f"servicio-con-un-nombre-largo-{i:03d}" for i in range(220)]
+	try:
+		for name in names:
+			store.set_container_update_mode("h_local", name, "auto")
+		dcb.save_container_update_status("x:latest", names[0], True, "h_local")
+		sections = [(HOST_FIXTURE[0], None, [_container("plex", "running")])]
+		dcb.forget_gone_container_settings(sections, now=0)
+		assert len(dcb.forget_gone_container_settings(sections, now=month)) == 220
+		assert dcb.read_container_update_status("x:latest", names[0], "h_local") is None
+		assert len(sent) > 1 and all(len(piece) <= 4096 for piece in sent), [len(p) for p in sent]
+		assert all(any(name in piece for piece in sent) for name in names)
+	finally:
+		dcb.send_message_to_notification_channel = original
+		store.forget_host_containers("h_local")
+		store.state_set("containers_absent", {})
+		_restore_hosts()
+
+
+def test_an_event_monitor_moved_to_another_url_starts_from_now_there():
+	"""
+	Before the supervisor replaced it, it asked the new daemon for everything
+	after the old one's last event, and its last minutes came out as news.
+	"""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	asked = []
+
+	class Client:
+		def events(self, decode=True, since=None, filters=None):
+			asked.append(since)
+			return iter(())
+	original = (dcb.host_registry.client, dcb._keep_alive)
+	dcb.host_registry.client = lambda host_id: Client()
+	dcb._keep_alive = lambda stream: None
+	try:
+		monitor = dcb.DockerEventMonitor("h_nas")
+		monitor._last_event_ns = int(time.time() - 100) * 1_000_000_000
+		monitor.detectar_eventos_contenedores()
+		assert asked[-1] is not None, "en la misma URL sí recupera lo que se perdió"
+		monitor._last_event_ns = int(time.time() - 100) * 1_000_000_000
+		dcb.host_registry.change_url("h_nas", "tcp://192.168.1.20:2375")
+		monitor.detectar_eventos_contenedores()
+		assert asked[-1] is None, "ha pedido al Docker nuevo los eventos del viejo"
+	finally:
+		dcb.host_registry.client, dcb._keep_alive = original
+		_restore_hosts()
+
+
+def test_an_edited_text_never_gets_a_link_preview():
+	"""An /info repainted from its button grew a GitHub card under it."""
+	calls = []
+	original = dcb.bot
+	dcb.bot = MagicMock()
+	dcb.bot.edit_message_text = lambda *a, **kw: calls.append(kw)
+	try:
+		dcb._edit_message_text_direct(1, 2, "<a href='https://github.com/x'>x</a>", "html", None)
+		assert calls[0]["link_preview_options"].is_disabled is True, calls
+	finally:
+		dcb.bot = original
+
+
+def test_a_tap_that_waited_on_the_daemon_does_not_bring_back_a_list_left_meanwhile():
+	"""
+	Back, or another page, pressed while a tap asked the daemon: the tap then
+	saved its own copy over it and painted the list back on the message.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	plex = _container("plex", "running")
+	repainted, answered = [], []
+	original = (dcb.DockerManager.container_named, dcb.render_settings,
+				dcb.edit_message_reply_markup_sync, dcb.answer_callback_quietly)
+	dcb.render_settings = lambda *a, **kw: None
+	dcb.edit_message_reply_markup_sync = lambda chat_id, message_id, reply_markup=None: repainted.append(reply_markup)
+	dcb.answer_callback_quietly = lambda call_id, text=None, show_alert=False: answered.append((text, show_alert))
+	press = lambda name, **fields: getattr(callbacks, name)(callback_registry.Context(
+		call=MagicMock(id="q"), chatId=1, messageId=2, **fields))
+	try:
+		def back_meanwhile(self, name):
+			press("cb_settingsUpdates")
+			return plex
+		dcb.DockerManager.container_named = back_meanwhile
+		dcb.save_container_list(1, 2, _container_list(plex))
+		press("cb_ctrToggle", field="h_local", containerIdx="0", value="a")
+		assert dcb.load_container_list(1, 2, "h_local") is None, "ha vuelto a guardar la lista"
+		assert repainted == [] and answered[-1][1] is True
+
+		big = _container_list(*[_container(f"c{i:03d}", "running") for i in range(120)])
+		dcb.save_container_list(1, 2, big)
+
+		def page_meanwhile(self, name):
+			press("cb_ctrPage", field="h_local", value="1")
+			return big["items"] and _container(name, "running")
+		dcb.DockerManager.container_named = page_meanwhile
+		press("cb_ctrToggle", field="h_local", containerIdx="0", value="a")
+		assert dcb.load_container_list(1, 2, "h_local")["page"] == 1, "la página volvió atrás"
+	finally:
+		(dcb.DockerManager.container_named, dcb.render_settings,
+			dcb.edit_message_reply_markup_sync, dcb.answer_callback_quietly) = original
+		dcb.clear_container_list(1, 2)
+		store.forget_host_containers("h_local")
+		_restore_hosts()
+
+
+def test_a_repainted_info_says_the_versions_and_last_check_there_are_now():
+	"""/info opened before the check found 1.0 → 2.0 said there was an update, but not which."""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	plex = _container("plex", "running", image="plex:latest")
+	edited = []
+	original = (dcb.edit_message_text, dcb.answer_callback_quietly)
+	dcb.edit_message_text = lambda text, chat_id, message_id, reply_markup=None, **kw: edited.append(text)
+	dcb.answer_callback_quietly = lambda *a, **kw: None
+	try:
+		dcb.write_cache_item(dcb._info_key(1, 2), _info(last_check_seconds=99999))
+		dcb.save_container_update_status("plex:latest", "plex", True, "h_local", ("1.0", "2.0"))
+		dcb.repaint_info("q", 1, 2, dcb.make_ref("h_local", "abc12"), found=(dcb.manager("h_local"), plex))
+		assert "2.0" in edited[-1] and i18n.get_text("info_update_available") in edited[-1], edited[-1]
+		assert dcb.human_duration(99999) not in edited[-1], "sigue la última comprobación de antes"
+	finally:
+		dcb.edit_message_text, dcb.answer_callback_quietly = original
+		dcb.save_container_update_status("plex:latest", "plex", None, "h_local")
+		dcb.clear_info_cache(1, 2)
+		_restore_hosts()
+
+
+def _press_with_the_name_not_cached(data, owner_for, named=None, message_id=9876, alerts=None, manager=None,
+									drawn_at=None):
+	"""
+	Presses `data` through the dispatcher on a message with no names saved,
+	`owner_for(ref)` standing in for manager_for and `named` for what the
+	host finds by name (or `manager` for the whole host). Returns what was
+	sent, what was deleted and which queries were answered; the alerts go
+	to `alerts`. The message was sent at `drawn_at`, by default just now.
+	"""
+	admin = int(str(dcb.TELEGRAM_ADMIN).split(",")[0])
+	sent, deleted, answers = [], [], []
+	alerts = [] if alerts is None else alerts
+	original = (dcb.manager_for, dcb.manager, dcb.send_message, dcb.delete_message,
+				dcb.close_multi_action_menu, dcb.answer_callback_quietly, dcb.edit_message_reply_markup_sync)
+	dcb.manager_for = owner_for
+	dcb.manager = manager or (lambda host_id=None: types.SimpleNamespace(container_named=lambda name: named))
+	dcb.send_message = lambda message="", **kw: sent.append(message)
+	dcb.delete_message = lambda *a, **kw: deleted.append(a)
+	dcb.close_multi_action_menu = lambda *a, **kw: deleted.append(a)
+
+	def answer(call_id, text=None, show_alert=False):
+		answers.append(call_id)
+		if text:
+			alerts.append(text)
+	dcb.answer_callback_quietly = answer
+	dcb.edit_message_reply_markup_sync = lambda *a, **kw: None
+	press = MagicMock()
+	press.data, press.id = data, "q1"
+	press.message.id, press.message.chat.id, press.message.chat.type = message_id, admin, "private"
+	press.message.date, press.message.edit_date = drawn_at or int(time.time()), None
+	press.from_user.id, press.from_user.username = admin, "test"
+	try:
+		dcb.button_controller(press)
+	finally:
+		(dcb.manager_for, dcb.manager, dcb.send_message, dcb.delete_message,
+		 dcb.close_multi_action_menu, dcb.answer_callback_quietly, dcb.edit_message_reply_markup_sync) = original
+	return sent, deleted, answers
+
+
+def _owner_whose_lookup(fails_with=None, finds=None):
+	def lookup(container_id):
+		if finds is not None:
+			return finds
+		raise fails_with
+	return lambda ref: types.SimpleNamespace(client=types.SimpleNamespace(containers=types.SimpleNamespace(get=lookup)))
+
+
+def test_a_button_on_a_host_that_does_not_answer_says_so_and_keeps_its_message():
+	"""
+	With the name not cached, the host down was taken for a container that
+	does not exist: the reply named its id instead, and the message went.
+
+	Down before the bot reaches it, or down under a client it already had
+	—a timeout from the lookup itself, the common case—, it is the same.
+	"""
+	import host_registry
+	import requests
+	local = dcb.host_registry.local_host_id()
+
+	def unreachable(ref):
+		raise host_registry.HostUnavailable(dcb.ref_host(ref), "connection refused")
+	dropped = _owner_whose_lookup(requests.exceptions.ConnectionError("connection aborted"))
+	for owner_for, reason in ((unreachable, "connection refused"), (dropped, "connection aborted")):
+		# One that the dispatcher answers before running, and one that
+		# answers itself: answered once either way.
+		for data in (f"logs|{local}:fffff", f"toggleUpdate|{local}:fffff"):
+			sent, deleted, answers = _press_with_the_name_not_cached(data, owner_for)
+			assert sent and reason in sent[-1] and "fffff" not in sent[-1], (data, sent)
+			assert deleted == [], f"{data}: ha borrado el mensaje"
+			assert answers == ["q1"], (data, answers)
+
+
+def test_a_button_on_a_container_that_is_gone_still_says_so():
+	"""The host answering that it is not there is what "no existe" means."""
+	import docker
+	local = dcb.host_registry.local_host_id()
+	sent, deleted, answers = _press_with_the_name_not_cached(
+		f"logs|{local}:fffff", _owner_whose_lookup(docker.errors.NotFound("No such container")))
+	assert sent and "fffff" in sent[-1] and "No such container" not in sent[-1], sent
+	assert deleted, "el menú tenía que cerrarse"
+	assert answers == ["q1"], answers
+
+
+def test_an_update_list_older_than_its_names_still_finds_a_recreated_container():
+	"""
+	The names saved with a list go a week after they are written; the list
+	itself lasts while someone uses it. Past that week, a toggle for a
+	container recreated since —compose, Watchtower— asked the host for the
+	old id, was told it did not exist, and deleted the whole list. The list
+	still says the name, and by name the host finds the new one.
+	"""
+	import docker
+	local = dcb.host_registry.local_host_id()
+	admin = int(str(dcb.TELEGRAM_ADMIN).split(",")[0])
+	old = dcb.make_ref(local, "dead0")
+	dcb.save_update_data(admin, 9877, [[old, "plex"]], set())
+	try:
+		sent, deleted, answers = _press_with_the_name_not_cached(
+			f"toggleUpdate|{old}", _owner_whose_lookup(docker.errors.NotFound("No such container")),
+			named=types.SimpleNamespace(id="beef0" + "0" * 59, name="plex"), message_id=9877)
+		assert deleted == [] and sent == [], (deleted, sent)
+		assert dcb.load_update_data(admin, 9877)[1] == {old}, "no ha marcado el contenedor"
+		assert answers == ["q1"], answers
+	finally:
+		dcb.clear_update_data(admin, 9877)
+
+
+def test_a_container_gone_from_an_update_list_leaves_the_list():
+	"""
+	Its toggle said "does not exist" and deleted the whole list, with every
+	other container's selection, and never answered the press. The list
+	stays, the answer goes on the button, and the one gone is left out when
+	the rest are confirmed. Other buttons close their menu as before.
+	"""
+	import docker
+	local = dcb.host_registry.local_host_id()
+	admin = int(str(dcb.TELEGRAM_ADMIN).split(",")[0])
+	plex, sonarr = dcb.make_ref(local, "aaaa1"), dcb.make_ref(local, "bbbb1")
+	dcb.save_update_data(admin, 9878, [[plex, "plex"], [sonarr, "sonarr"]], {plex})
+	try:
+		alerts = []
+		sent, deleted, answers = _press_with_the_name_not_cached(
+			f"toggleUpdate|{sonarr}", _owner_whose_lookup(docker.errors.NotFound("No such container")),
+			message_id=9878, alerts=alerts)
+		assert deleted == [] and sent == [], (deleted, sent)
+		assert answers == ["q1"] and len(alerts) == 1 and "sonarr" in alerts[0] and "<b>" not in alerts[0], (answers, alerts)
+		assert dcb.load_update_data(admin, 9878)[1] == {plex}, "ha tocado la selección"
+	finally:
+		dcb.clear_update_data(admin, 9878)
+
+
+def test_a_gone_container_is_not_found_again_by_its_id_prefix():
+	"""
+	A reference carries five characters of the id, which a container created
+	since can share. Not found by its name, the container is gone: looked for
+	again by that prefix, the press —a stop, a delete— landed on the other
+	one. And a prefix two containers share says nothing about the host.
+	"""
+	import docker
+	local = dcb.host_registry.local_host_id()
+	admin = int(str(dcb.TELEGRAM_ADMIN).split(",")[0])
+	ref = dcb.make_ref(local, "ff2e3")
+	dcb.save_update_data(admin, 9879, [[ref, "c371"]], set())
+	acted = []
+	original = dcb.logs
+	dcb.logs = lambda *a, **k: acted.append(a)
+	try:
+		for data in (f"toggleUpdate|{ref}", f"logs|{ref}"):
+			alerts = []
+			sent, deleted, answers = _press_with_the_name_not_cached(
+				data, _owner_whose_lookup(finds=types.SimpleNamespace(name="c1015")),
+				named=None, message_id=9879, alerts=alerts)
+			assert acted == [] and dcb.load_update_data(admin, 9879)[1] == set(), (data, acted)
+			assert "c1015" not in "".join(sent + alerts) and "c371" in "".join(sent + alerts), (data, sent, alerts)
+			assert answers == ["q1"], (data, answers)
+		import requests
+		response = requests.Response()
+		response.status_code, response.reason, response.url = 400, "Bad Request", "http+docker://localhost/containers/ff2e3/json"
+		ambiguous = docker.errors.APIError("multiple IDs found with provided prefix", response=response)
+		before = dcb.manager_for
+		dcb.manager_for = _owner_whose_lookup(ambiguous)
+		try:
+			assert dcb.name_by_reference(ref, int(time.time())) == (None, None)
+		finally:
+			dcb.manager_for = before
+	finally:
+		dcb.logs = original
+		dcb.clear_update_data(admin, 9879)
+
+
+def test_a_button_with_no_name_does_not_act_on_a_container_created_after_it():
+	"""
+	A confirmation keeps no names: its button says the host and five
+	characters of the ID, and nothing else. With the container it meant
+	recreated since, another whose ID starts the same was what the prefix
+	found, and the delete landed on it. One created after the message cannot
+	be the button's, so the button's is gone; one already there when it was
+	sent still answers.
+	"""
+	from datetime import datetime, timezone
+	local = dcb.host_registry.local_host_id()
+	ref = dcb.make_ref(local, "ff2e3")
+	sent_at = int(time.time()) - 3600
+	for name, created, acts in (("c1015", sent_at + 60, False), ("plex", sent_at - 60, True)):
+		stamp = datetime.fromtimestamp(created, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
+		found = types.SimpleNamespace(id="ff2e3" + "1" * 59, name=name, attrs={"Created": stamp})
+		removed = []
+
+		def owner_for(r):
+			return types.SimpleNamespace(
+				client=types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda cid: found)),
+				delete=lambda container_id, container_name: removed.append(container_name) or "")
+		sent, deleted, answers = _press_with_the_name_not_cached(
+			f"delete|{ref}", owner_for, named=found, drawn_at=sent_at)
+		if acts:
+			assert removed == ["plex"], (name, removed, sent)
+		else:
+			assert removed == [] and "c1015" not in "".join(sent), (removed, sent)
+			assert sent and "ff2e3" in sent[-1], sent
+		assert answers == ["q1"], (name, answers)
+
+
+def test_a_known_name_on_a_host_that_does_not_answer_is_answered_once():
+	"""
+	The name known —here from the list itself—, the host is asked for it by
+	name, and does not answer: said so, the message kept, the press answered
+	once whether or not the dispatcher had answered it already.
+	"""
+	import host_registry
+	local = dcb.host_registry.local_host_id()
+	admin = int(str(dcb.TELEGRAM_ADMIN).split(",")[0])
+	ref = dcb.make_ref(local, "dead0")
+	dcb.save_update_data(admin, 9880, [[ref, "plex"]], set())
+
+	def unreachable(host_id=None):
+		raise host_registry.HostUnavailable(host_id or local, "connection refused")
+	try:
+		for data in (f"logs|{ref}", f"toggleUpdate|{ref}"):
+			sent, deleted, answers = _press_with_the_name_not_cached(
+				data, _owner_whose_lookup(AssertionError("asked by id")), message_id=9880, manager=unreachable)
+			assert sent and "connection refused" in sent[-1], (data, sent)
+			assert deleted == [], data
+			assert answers == ["q1"], (data, answers)
+	finally:
+		dcb.clear_update_data(admin, 9880)
+
+
+def test_unraid_is_told_about_an_update_once_it_went_through():
+	"""
+	Only a container that was actually updated, and the bot itself when it
+	comes back from updating: it goes down before it could say so.
+	"""
+	told = []
+
+	class Owner:
+		host_id = "h_local"
+
+		def __init__(self, works):
+			self.works = works
+			# Outside any Compose project, so there are no dependents to restart.
+			self.client = MagicMock()
+			self.client.containers.get.return_value.labels = {}
+
+		def update(self, **kw):
+			return i18n.get_text("updated_container" if self.works else "error_updating_container", "nginx")
+
+	original = dcb.manager, dcb.tell_unraid_updated
+	dcb.tell_unraid_updated = lambda owner, container: told.append((owner.host_id, container))
+	try:
+		ref = dcb.make_ref("h_local", "abcde")
+		dcb.manager = lambda host_id=None: Owner(True)
+		dcb.perform_container_update(ref, "nginx", send_fn=lambda msg: None)
+		assert len(told) == 1, told
+		told.clear()
+		dcb.manager = lambda host_id=None: Owner(False)
+		dcb.perform_container_update(ref, "nginx", send_fn=lambda msg: None)
+		assert told == [], told
+	finally:
+		dcb.manager, dcb.tell_unraid_updated = original
+
+	local = MagicMock()
+	local.host_id = "h_local"
+	stubs = {"get_container_id_by_name": lambda name: "f" * 64, "local_manager": lambda: local,
+			 "own_container_name": lambda: "docker-controller-bot", "stop_container": lambda container: None,
+			 "send_message": lambda **kw: None, "tell_unraid_updated": lambda owner, container: told.append((owner, container))}
+	saved = {name: getattr(dcb, name) for name in stubs}
+	for name, stub in stubs.items():
+		setattr(dcb, name, stub)
+	try:
+		dcb.delete_updater()
+		assert told == [(local, local.client.containers.get.return_value)], told
+		assert local.client.containers.get.call_args.args == ("docker-controller-bot",)
+	finally:
+		for name, value in saved.items():
+			setattr(dcb, name, value)

@@ -1,0 +1,199 @@
+import math
+import os
+
+# DOCKER ENVIRONMENT VARIABLES
+#
+# Only what the bot needs before it can read its own settings file lives here:
+# how to reach Telegram, who is allowed to talk to it, and which container it
+# is. Everything else is a setting, managed from /settings. The dividing line
+# is that a wrong value in any of these can lock you out of the bot, and you
+# cannot fix from the chat what stops the chat from working.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_ADMIN = os.environ.get("TELEGRAM_ADMIN")
+TELEGRAM_GROUP = os.environ.get("TELEGRAM_GROUP")
+TELEGRAM_THREAD = os.environ.get("TELEGRAM_THREAD", "1")
+# Opcional desde la 5.0.0, y solo como red de seguridad. El bot averigua cuál
+# es su propio contenedor leyendo /proc y preguntándole al daemon local — ver
+# own_container.py—, así que ya no hace falta decírselo. Se sigue leyendo para
+# no romperle el arranque a nadie que la tenga puesta, y para tener algo a lo
+# que agarrarse si la detección fallara en un entorno raro.
+CONTAINER_NAME = os.environ.get("CONTAINER_NAME")
+
+def _as_bool(raw):
+    """Reads the 0/1 flags the bot has always used, tolerating true/false too."""
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+def _as_language(raw):
+    """
+    Normalises a language code to the casing used everywhere else.
+
+    The variable was accepted in any case, and storing it verbatim would leave
+    the settings file holding "es" for someone upgrading and "ES" for someone
+    who picked it from the menu.
+    """
+    code = str(raw).strip().upper()
+    return code if code in SUPPORTED_LANGUAGES else "ES"
+
+def as_interval_hours(raw):
+    """
+    Reads an update-check interval in hours, raising ValueError when it is not one.
+
+    float() alone takes "nan" and "inf", and neither fails a "> 0" check:
+    "nan <= 0" is False. Stored, either one left the wait for the next check
+    never ending, and the menu that prints the interval raising on int().
+    """
+    hours = float(str(raw).strip().replace(",", "."))
+    if not math.isfinite(hours) or hours <= 0:
+        raise ValueError(f"not a positive number of hours: {raw!r}")
+    return hours
+
+SUPPORTED_LANGUAGES = ("ES", "EN", "NL", "DE", "RU", "GL", "IT", "CAT")
+
+# Variables that became settings in 5.0.0, mapped to their key in the settings
+# file. On the first run they seed it, so updating from 4.x keeps every value
+# the user had. From then on the settings file is the only source and a
+# variable still present in the compose only earns a deprecation warning:
+# letting it win would mean a change made in /settings silently reverts on the
+# next restart.
+SETTINGS_FROM_ENV = {
+    "LANGUAGE": ("bot.language", _as_language),
+    "BUTTON_COLUMNS": ("bot.button_columns", int),
+    "EXTENDED_MESSAGES": ("bot.extended_messages", _as_bool),
+    "MULTI_SELECTION": ("bot.multi_selection", _as_bool),
+    "TELEGRAM_NOTIFICATION_CHANNEL": ("bot.notification_channel", str),
+    "CHECK_UPDATES": ("bot.check_updates", _as_bool),
+    "CHECK_UPDATE_EVERY_HOURS": ("bot.check_update_every_hours", as_interval_hours),
+    "CHECK_UPDATE_STOPPED_CONTAINERS": ("bot.check_update_stopped_containers", _as_bool),
+}
+
+# Anonymous usage statistics. On by default, turned off from /settings or with
+# TELEMETRY=0, which telemetry.py reads itself: it is the same variable in all
+# of the projects that share that client.
+# Development only, not documented: sends a minute after every start instead
+# of once a day. Debug pings go to a server on the same machine unless told
+# otherwise, never to the real one, where they would count as installations.
+TELEMETRY_DEBUG = _as_bool(os.environ.get("TELEMETRY_DEBUG", "0"))
+TELEMETRY_ENDPOINT = os.environ.get(
+    "TELEMETRY_ENDPOINT",
+    "http://host.docker.internal:8000/v1/ping" if TELEMETRY_DEBUG else "https://telemetry.dgongut.com/v1/ping")
+
+# CONSTANTS
+UPDATER_IMAGE = "dgongut/docker-container-updater:latest"
+UPDATER_CONTAINER_NAME = "UPDATER-Docker-Controler-Bot"
+CONTAINER_ID_LENGTH = 5
+ANONYMOUS_USER_ID = "1087968824"
+# Shown in the language picker. Each language is named in itself, which is what
+# someone looking for their own language actually scans for.
+LANGUAGE_NAMES = {
+    "ES": "Español",
+    "EN": "English",
+    "NL": "Nederlands",
+    "DE": "Deutsch",
+    "RU": "Русский",
+    "GL": "Galego",
+    "IT": "Italiano",
+    "CAT": "Català",
+}
+ICON_CONTAINER_MARK_FOR_UPDATE = "➕"
+ICON_CONTAINER_MARKED_FOR_UPDATE = "✅"
+ICON_CONTAINER_ACTION_DONE = "✅"
+
+# LABELS
+LABEL_IGNORE_CHECK_UPDATES = "DCB-Ignore-Check-Updates"
+LABEL_AUTO_UPDATE = "DCB-Auto-Update"
+# Which of a container's start, stop and health notifications are sent:
+# DCB-Notifications=problems or =none. See NOTIFICATION_LEVELS.
+LABEL_NOTIFICATIONS = "DCB-Notifications"
+
+# What the event monitor tells about a container, besides everything, which is
+# the default. "problems" leaves out what was expected —starts, stops asked
+# for, a process that finished with 0— and keeps failures, running out of
+# memory, failing healthchecks, restart loops and their recovery. "none"
+# leaves it all out. The same values for the label and for the setting.
+NOTIFICATION_LEVELS = ("problems", "none")
+
+# The only container events the monitor reads, asked of the daemon as a filter
+# so the rest never reach the bot: every exec of a healthcheck alone is three
+# events, and image, network and volume events are of no use to it. Anything
+# the monitor starts reading has to be in here, or it never arrives. A
+# health_status filter matches every "health_status: <status>".
+MONITORED_EVENTS = ("create", "start", "kill", "die", "oom", "destroy", "health_status")
+
+
+def label_enabled(labels, name):
+    """
+    Whether a DCB-* label is switched on in a container's labels.
+
+    Written bare (`- "DCB-Auto-Update"`) it carries an empty value, and that
+    means on. Only looking for the key turned `DCB-Auto-Update=false` into an
+    auto-update — the opposite of what it says — so an explicit no is read
+    as no.
+    """
+    if not labels or name not in labels:
+        return False
+    return str(labels[name]).strip().lower() not in ("false", "0", "no", "off")
+
+docker_architectures = {
+    "x86_64": "amd64",
+    "i386": "i386",
+    "386": "386",
+    "amd64": "amd64",
+    "arm": "arm32v7",
+    "arm64": "arm64",
+    "aarch64": "arm64",
+    "ppc64le": "ppc64le",
+    "s390x": "s390x",
+    "unknown": "unknown",
+}
+
+# Techo del silencio, en minutos: treinta días. No es una preferencia sino un
+# límite técnico — el temporizador que devuelve la voz al bot se programa con
+# ese número, y uno absurdo lo mata con OverflowError dentro de su hilo, con lo
+# que el bot se queda callado para siempre y sin nada que lo despierte.
+MUTE_MAX_MINUTES = 60 * 24 * 30
+
+# File in the data volume a script writes the epoch second a mute ends at into,
+# as in 4.x. The bot applies it and deletes it; dcb-mute writes it for you.
+EXTERNAL_MUTE_FILE = ".muted_until"
+
+# What each scheduled action carries besides its name and cron, in the order
+# the wizard asks for it. A container brings the host it is on, which is why
+# only a prune, that names none, asks for its host. Everything else about
+# schedules —which actions exist, which act on a host, what the wizard asks,
+# what a valid task holds— comes from this one table.
+SCHEDULE_ACTION_FIELDS = {
+    "run": ("container",),
+    "stop": ("container",),
+    "restart": ("container",),
+    "mute": ("minutes",),
+    "exec": ("container", "command", "show_output"),
+    "prune": ("prune_type", "host", "show_output"),
+}
+
+SCHEDULE_ACTIONS = tuple(SCHEDULE_ACTION_FIELDS)
+
+# The actions that act on a Docker host. A mute is the bot's own notifications.
+HOST_SCOPED_SCHEDULE_ACTIONS = frozenset(
+    action for action, fields in SCHEDULE_ACTION_FIELDS.items()
+    if "container" in fields or "host" in fields)
+
+SCHEDULE_PRUNE_TYPES = ("containers", "images", "networks", "volumes")
+
+# The third value of a scheduled task's show_output, besides true and false:
+# only say something when the exec fails or prints, or the prune fails or
+# frees something. A string, so the tasks saved as true/false keep meaning
+# what they did.
+SHOW_OUTPUT_FAILURES = "failures"
+
+# SPECIAL CRON EXPRESSIONS - Supported by croniter and custom
+# These are aliases that can be used instead of full cron expressions
+SPECIAL_CRON_EXPRESSIONS = [
+    "@yearly",      # Run once a year (0 0 1 1 *)
+    "@annually",    # Same as @yearly
+    "@monthly",     # Run once a month (0 0 1 * *)
+    "@weekly",      # Run once a week (0 0 * * 0)
+    "@daily",       # Run once a day (0 0 * * *)
+    "@midnight",    # Same as @daily
+    "@hourly",      # Run once an hour (0 * * * *)
+    "@reboot",      # Run at system boot (custom handling)
+]

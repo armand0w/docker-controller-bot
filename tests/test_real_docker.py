@@ -19,7 +19,7 @@ container outside Compose was left inside the dead one.
 	python3 tests/run_all.py --docker
 
 Needs a daemon on /var/run/docker.sock, and pulls `registry:2` and
-`alpine:3.24.2` the first time. Updates need a registry to pull the "new"
+`alpine:3.24.3` the first time. Updates need a registry to pull the "new"
 image from, so one runs on 127.0.0.1:55000 for the duration.
 
 Only what these tests create is touched: every container, network and volume
@@ -38,8 +38,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
 
-if harness.REPO not in sys.path:
-	sys.path.insert(0, harness.REPO)
+if harness.SRC not in sys.path:
+	sys.path.insert(0, harness.SRC)
 
 import docker
 import docker.errors
@@ -52,7 +52,7 @@ LABEL = {"dcbtest": "1"}
 REGISTRY_NAME = f"{PREFIX}registry"
 REGISTRY = "localhost:55000"
 IMAGE = f"{REGISTRY}/dcbtest/app"
-BASE = "alpine:3.24.2"
+BASE = "alpine:3.24.3"
 
 # PID 1 ignores SIGTERM unless it says otherwise, and every stop would then
 # wait out its whole grace period: minutes, across the file.
@@ -190,8 +190,22 @@ VOLATILE_PARTS = ("EndpointID", "NetworkID", "DNSNames", ".Gateway", ".IPAddress
 					".GlobalIPv6", ".IPv6Gateway")
 
 
+def _without_own_alias(attrs):
+	"""
+	The inspect without the alias API 1.44 (Docker 25) adds with the
+	container's own short id: a new container has another one.
+	"""
+	import copy
+	attrs = copy.deepcopy(attrs)
+	own = (attrs.get("Id") or "")[:12]
+	for endpoint in ((attrs.get("NetworkSettings") or {}).get("Networks") or {}).values():
+		if isinstance(endpoint, dict) and endpoint.get("Aliases"):
+			endpoint["Aliases"] = [alias for alias in endpoint["Aliases"] if alias != own]
+	return attrs
+
+
 def differences(before, after, allowed=()):
-	fa, fb = _flat(before), _flat(after)
+	fa, fb = _flat(_without_own_alias(before)), _flat(_without_own_alias(after))
 	found = {}
 	for key in sorted(set(fa) | set(fb)):
 		if any(key == v or key.startswith(v + ".") for v in VOLATILE + tuple(allowed)):
@@ -201,6 +215,27 @@ def differences(before, after, allowed=()):
 		if fa.get(key) != fb.get(key):
 			found[key] = (fa.get(key), fb.get(key))
 	return found
+
+
+def carried_anonymous_mounts(before, after):
+	"""
+	`after` with the Source the update gave each anonymous `--mount
+	type=volume` taken out again, once checked: it has to be the volume the
+	old container had there, by name, which is how the data survives
+	(docker_update's `mount_volume_names`, as compose does on a recreate).
+	"""
+	import copy
+	old_names = {m.get("Destination"): m.get("Name") for m in before.get("Mounts") or [] if m.get("Type") == "volume"}
+	sourceless = {m.get("Target") for m in (before.get("HostConfig") or {}).get("Mounts") or []
+					if m.get("Type") == "volume" and not m.get("Source")}
+	after = copy.deepcopy(after)
+	for mount in (after.get("HostConfig") or {}).get("Mounts") or []:
+		# Required, not just accepted: without it the new container got a fresh,
+		# empty volume, and the Mounts would read the same as before.
+		if mount.get("Target") in sourceless and old_names.get(mount.get("Target")):
+			assert mount.get("Source") == old_names[mount["Target"]], (mount, old_names)
+			del mount["Source"]
+	return after
 
 
 # --- Tests -------------------------------------------------------------------
@@ -235,7 +270,8 @@ def _full_container():
 		mounts=[docker.types.Mount(target="/ro", source=f"{PREFIX}vol", type="volume", read_only=True)],
 	)
 	networking = api.create_networking_config({f"{PREFIX}net1": api.create_endpoint_config(
-		ipv4_address="172.31.250.10", aliases=["web"], mac_address="02:42:ac:1f:fa:0a")})
+		ipv4_address="172.31.250.10", aliases=["web"], mac_address="02:42:ac:1f:fa:0a",
+		link_local_ips=["169.254.7.7"])})
 	created = api.create_container(
 		f"{IMAGE}:latest", name=f"{PREFIX}full", command=["sh", "-c", "trap 'exit 0' TERM; sleep 999 & wait"],
 		environment=["FOO=bar"], labels={**LABEL, "user.label": "x"}, working_dir="/tmp", user="1000:1000",
@@ -244,7 +280,7 @@ def _full_container():
 		volumes=["/anon"], ports=[80, (53, "udp"), 8080, 9090],
 		host_config=host_config, networking_config=networking)
 	container = client.containers.get(created["Id"])
-	net2.connect(container, aliases=["second"], ipv4_address="172.31.251.20")
+	net2.connect(container, aliases=["second"], ipv4_address="172.31.251.20", link_local_ips=["169.254.8.8"])
 	container.start()
 	container.exec_run(["sh", "-c", "echo keep > /anon/file"], user="root")
 	container.reload()
@@ -303,7 +339,14 @@ def test_the_compose_of_a_container_rebuilds_it():
 		done = subprocess.run(["docker", "compose", "-p", "dcbtest", "up", "-d"],
 								cwd=directory, capture_output=True, text=True)
 		assert done.returncode == 0, done.stderr + "\n" + document
-		found = differences(before, fetch("full").attrs, allowed=(
+		after = fetch("full").attrs
+		# Compose 2.29 gives the network mode as the network's id, and Docker
+		# 25 to 28 then leave Config.MacAddress empty: the MAC is on the
+		# endpoint, looked at below.
+		by_id = after["HostConfig"]["NetworkMode"] == client.networks.get(f"{PREFIX}net1").id
+		if before["Config"].get("MacAddress"):
+			assert after["NetworkSettings"]["Networks"][f"{PREFIX}net1"]["MacAddress"] == before["Config"]["MacAddress"]
+		found = differences(before, after, allowed=(("HostConfig.NetworkMode", "Config.MacAddress") if by_id else ()) + (
 			# Compose's own bookkeeping.
 			"Config.Labels.com.docker.compose",
 			# The same mounts, written the way compose writes them: the
@@ -321,6 +364,55 @@ def test_the_compose_of_a_container_rebuilds_it():
 		))
 		assert not found, "no sobrevivió al compose:\n" + "\n".join(
 			f"  {k}: {a!r} -> {b!r}" for k, (a, b) in found.items()) + "\n" + document
+	finally:
+		cleanup()
+
+
+def test_a_second_compose_keeps_the_main_network_and_its_mac():
+	"""
+	/compose, `up`, and /compose again, on a container whose main network
+	sorts after its other one, with a MAC set by hand. Compose took the
+	first by name for the primary: the MAC came back on another interface,
+	or, written under its own network, the second /compose had lost it.
+
+	Not on Docker 29, which never says a MAC was set by hand, nor on Docker
+	28 after a Compose that gives the network mode as an id (2.29), which
+	has it not say it either. Docker 25 to 27 still tell it by the MAC
+	itself, theirs coming from the address.
+	"""
+	from compose_generator import ComposeGenerator
+	_setup()
+	try:
+		publish("1")
+		for name, subnet in (("zlan", "172.31.240.0/24"), ("app", "172.31.241.0/24")):
+			client.networks.create(f"{PREFIX}{name}", labels=LABEL, ipam=docker.types.IPAMConfig(
+				pool_configs=[docker.types.IPAMPool(subnet=subnet)]))
+		mac = "02:42:ac:1f:f0:0a"
+		for command in (["run", "-d", "--label", "dcbtest=1", "--name", f"{PREFIX}twice", "--network", f"{PREFIX}zlan",
+						 "--mac-address", mac, f"{IMAGE}:latest"],
+						["network", "connect", f"{PREFIX}app", f"{PREFIX}twice"]):
+			done = subprocess.run(["docker", *command], capture_output=True, text=True)
+			assert done.returncode == 0, (command, done.stderr)
+		# Whether the next /compose has nowhere to read the MAC from.
+		mac_unsaid = not docker.utils.version_lt(client.api._version, "1.52")
+		for generation in (1, 2):
+			container = fetch("twice")
+			document = ComposeGenerator(container.name, docker_update.extract_container_config(container)).to_yaml()
+			container.remove(force=True)
+			directory = tempfile.mkdtemp()
+			with open(os.path.join(directory, "compose.yaml"), "w") as handle:
+				handle.write(document)
+			done = subprocess.run(["docker", "compose", "-p", "dcbtest", "up", "-d"],
+									cwd=directory, capture_output=True, text=True)
+			assert done.returncode == 0, done.stderr + "\n" + document
+			after = fetch("twice").attrs
+			mode = after["HostConfig"]["NetworkMode"]
+			by_id = mode == client.networks.get(f"{PREFIX}zlan").id
+			assert mode == f"{PREFIX}zlan" or by_id, (generation, mode, document)
+			if not mac_unsaid:
+				assert after["NetworkSettings"]["Networks"][f"{PREFIX}zlan"]["MacAddress"] == mac, (generation, document)
+				assert after["NetworkSettings"]["Networks"][f"{PREFIX}app"]["MacAddress"] != mac, (generation, document)
+			mac_unsaid = mac_unsaid or (by_id and not docker.utils.version_lt(client.api._version, "1.48"))
 	finally:
 		cleanup()
 
@@ -362,20 +454,40 @@ def test_the_new_images_defaults_replace_the_old_ones():
 
 
 def test_a_stopped_container_stays_stopped_and_a_created_one_unstarted():
+	"""
+	And a stopped one keeps the MAC set by hand, which a stopped container
+	does not report on its endpoints: a stopped Pi-hole on macvlan lost its
+	DHCP reservation on the first update.
+	"""
 	_setup()
 	try:
 		publish("1")
 		stopped = run("stopped")
 		stopped.stop(timeout=0)
 		created = client.containers.create(f"{IMAGE}:latest", name=f"{PREFIX}created", labels=LABEL)
+		client.networks.create(f"{PREFIX}stopnet", labels=LABEL, ipam=docker.types.IPAMConfig(
+			pool_configs=[docker.types.IPAMPool(subnet="172.31.236.0/24")]))
+		mac = "02:42:ac:1f:ec:63"
+		done = subprocess.run(["docker", "run", "-d", "--label", "dcbtest=1", "--name", f"{PREFIX}stoppedmac",
+								# With a fixed IP the MAC has to go on the endpoint, and the
+								# create cannot fall back on the container's own field.
+								"--network", f"{PREFIX}stopnet", "--ip", "172.31.236.10", "--mac-address", mac, f"{IMAGE}:latest"],
+								capture_output=True, text=True)
+		assert done.returncode == 0, done.stderr
+		fetch("stoppedmac").stop(timeout=0)
 		publish("2")
-		for container, expected in ((stopped, "exited"), (created, "created")):
+		for container in (stopped, created, fetch("stoppedmac")):
 			result, errors = update(container)
 			assert result == "updated_container", (container.name, result, errors)
 		# A stopped container comes back created: it was never started, which
 		# is what matters.
 		assert fetch("stopped").status in ("created", "exited"), fetch("stopped").status
 		assert fetch("created").status == "created", fetch("created").status
+		again = fetch("stoppedmac")
+		assert again.status in ("created", "exited"), again.status
+		again.start()
+		again.reload()
+		assert again.attrs["NetworkSettings"]["Networks"][f"{PREFIX}stopnet"]["MacAddress"] == mac, again.attrs["NetworkSettings"]
 	finally:
 		cleanup()
 
@@ -766,8 +878,27 @@ def _compose_project(document, extra_files=None):
 		handle.write(document)
 	done = subprocess.run(["docker", "compose", "-p", "dcbtest", "up", "-d", "--wait"],
 							cwd=directory, capture_output=True, text=True)
+	if done.returncode != 0 and "has no healthcheck configured" in done.stderr:
+		# Compose 2 takes a service whose healthcheck is disabled for one that
+		# never says it is healthy, and gives up on `--wait`; Compose 5 waits
+		# for it to run. Everything is up by then: waited for here instead.
+		_wait_for_project()
+		return directory
 	assert done.returncode == 0, done.stderr
 	return directory
+
+
+def _wait_for_project(seconds=120):
+	"""Until every container of the project runs, and is healthy if it says."""
+	deadline = time.time() + seconds
+	while time.time() < deadline:
+		states = [c.attrs.get("State") or {} for c in _project_containers().values()]
+		if states and all(state.get("Status") == "running"
+							and (state.get("Health") or {}).get("Status", "healthy") == "healthy"
+							for state in states):
+			return
+		time.sleep(1)
+	raise AssertionError("el proyecto no llegó a arrancar entero")
 
 
 def _project_containers():
@@ -813,7 +944,7 @@ def test_every_service_of_a_monstrous_compose_survives_its_update():
 		for name, attrs in before.items():
 			after = client.containers.get(name)
 			assert after.status == "running", (name, after.status)
-			diff = differences(attrs, after.attrs, allowed=(
+			diff = differences(attrs, carried_anonymous_mounts(attrs, after.attrs), allowed=(
 				"Config.Labels.com.docker.compose", "HostConfig.Binds",
 				# Compose leaves the hostname to Docker: the short id, new.
 				"Config.Hostname",
@@ -846,6 +977,11 @@ def test_a_container_forced_to_another_platform_keeps_it():
 	x86_64 container into an aarch64 one without a word.
 	"""
 	_setup()
+	# With the classic image store, pulling the other platform moves the tag
+	# itself to it, and every test after this one —and the developer's own
+	# alpine— went on running emulated. The image it pointed at is still
+	# there, untagged: it is tagged back.
+	native = client.images.get(BASE).id
 	try:
 		architecture = client.info()["Architecture"]
 		foreign = "linux/arm64" if architecture in ("x86_64", "amd64") else "linux/amd64"
@@ -859,6 +995,9 @@ def test_a_container_forced_to_another_platform_keeps_it():
 		assert fetch("foreign").exec_run(["uname", "-m"]).output == expected, "cambió de arquitectura"
 	finally:
 		cleanup()
+		if client.images.get(BASE).id != native:
+			repository, tag = BASE.rsplit(":", 1)
+			client.api.tag(native, repository, tag)
 
 
 def test_a_one_shot_job_runs_again_and_its_dependents_do_not_wait_for_nothing():
@@ -997,10 +1136,14 @@ def test_docker_run_oddities_survive_their_update():
 	"""
 	`--link` on the default bridge, macvlan with a fixed IP and MAC, two
 	networks with gateway priorities and a fixed MAC on the second, a paused
-	container, `systempaths=unconfined`, a volume with driver options and an
-	image mount. Found here: the gateway priorities came back 0, the second
-	network's MAC was lost, the paused container came back running and /proc
-	came back masked.
+	container, `systempaths=unconfined`, a volume with driver options, an
+	image mount, a main network given by its id with a fixed MAC, a second
+	network whose address the update changes, and a network given by its
+	short id. Found here: the gateway priorities came back 0, the second
+	network's MAC was lost, the paused container came back running, /proc
+	came back masked, the MAC on a network given by id was lost, the old
+	address's MAC was kept on the new one, and the short id one did not
+	start again.
 	"""
 	_setup()
 	try:
@@ -1012,23 +1155,58 @@ def test_docker_run_oddities_survive_their_update():
 				"--gateway", "192.168.250.1", "-o", "parent=eth0", f"{PREFIX}mac"],
 			["network", "create", *label, "--subnet", "172.31.230.0/24", f"{PREFIX}gwa"],
 			["network", "create", *label, "--subnet", "172.31.231.0/24", f"{PREFIX}gwb"],
+			["network", "create", *label, "--subnet", "172.31.232.0/24", f"{PREFIX}idnet"],
+			["network", "create", *label, "--subnet", "172.31.233.0/24", f"{PREFIX}dyn"],
+			["network", "create", *label, "--subnet", "172.31.234.0/24", f"{PREFIX}short"],
+			["network", "create", *label, "--subnet", "172.31.235.0/24", f"{PREFIX}short2"],
 			["run", "-d", *label, "--name", f"{PREFIX}target", image],
 			["run", "-d", *label, "--name", f"{PREFIX}link", "--link", f"{PREFIX}target:tgt", image],
 			["run", "-d", *label, "--name", f"{PREFIX}macvlan", "--network", f"{PREFIX}mac",
 				"--ip", "192.168.250.10", "--mac-address", "02:42:c0:a8:fa:0a", image],
-			["run", "-d", *label, "--name", f"{PREFIX}gw", "--network", f"name={PREFIX}gwa,gw-priority=1",
-				"--network", f"name={PREFIX}gwb,gw-priority=10,ip=172.31.231.9,mac-address=02:42:ac:1f:e7:09", image],
 			["run", "-d", *label, "--name", f"{PREFIX}paused", image],
 			["pause", f"{PREFIX}paused"],
 			["run", "-d", *label, "--name", f"{PREFIX}sysp", "--security-opt", "systempaths=unconfined", image],
 			["run", "-d", *label, "--name", f"{PREFIX}volopt", "--mount",
 				"type=volume,dst=/opt/t,volume-driver=local,volume-opt=type=tmpfs,volume-opt=device=tmpfs,volume-opt=o=size=1m", image],
-			["run", "-d", *label, "--name", f"{PREFIX}imgmount", "--mount", f"type=image,source={BASE},target=/img", image],
 		]
+		names = ["link", "macvlan", "paused", "sysp", "volopt"]
+		# Gateway priorities and image mounts are Docker 28's (API 1.48).
+		gateway_priorities = not docker.utils.version_lt(client.api._version, "1.48")
+		gw_main, gw_second = (",gw-priority=10", ",gw-priority=5") if gateway_priorities else ("", "")
+		if gateway_priorities:
+			commands += [
+				["run", "-d", *label, "--name", f"{PREFIX}gw", "--network", f"name={PREFIX}gwa,gw-priority=1",
+					"--network", f"name={PREFIX}gwb,gw-priority=10,ip=172.31.231.9,mac-address=02:42:ac:1f:e7:09", image],
+				["run", "-d", *label, "--name", f"{PREFIX}imgmount", "--mount", f"type=image,source={BASE},target=/img", image],
+			]
+			names += ["gw", "imgmount"]
 		for command in commands:
 			done = subprocess.run(["docker", *command], capture_output=True, text=True)
 			assert done.returncode == 0, (command, done.stderr)
-		names = ["link", "macvlan", "gw", "paused", "sysp", "volopt", "imgmount"]
+		# The main network given by its id, with a MAC set by hand: Docker 25
+		# to 28 leave Config.MacAddress empty then, and the update took the
+		# MAC for one Docker assigned.
+		# A second network without a fixed IP, whose address the update
+		# changes: Docker 25 to 27 make the MAC from it, and the old one kept
+		# was the next container's on that address.
+		# And a network given by its short id with endpoint options, which
+		# Docker lists twice; created on both, it would not start.
+		later = [
+			["run", "-d", *label, "--name", f"{PREFIX}byid",
+				"--network", f"name={client.networks.get(f'{PREFIX}idnet').id},mac-address=02:42:ac:1f:e8:0b",
+				"--network", f"{PREFIX}gwb", image],
+			["run", "-d", *label, "--name", f"{PREFIX}holder", "--network", f"{PREFIX}dyn", image],
+			["run", "-d", *label, "--name", f"{PREFIX}dyn", "--network", f"{PREFIX}gwb", image],
+			["network", "connect", f"{PREFIX}dyn", f"{PREFIX}dyn"],
+			["rm", "-f", "-v", f"{PREFIX}holder"],
+			["run", "-d", *label, "--name", f"{PREFIX}byshort",
+				"--network", f"name={client.networks.get(f'{PREFIX}short').id[:12]},ip=172.31.234.30{gw_main}",
+				"--network", f"name={PREFIX}short2,mac-address=02:aa:00:00:02:40{gw_second}", image],
+		]
+		for command in later:
+			done = subprocess.run(["docker", *command], capture_output=True, text=True)
+			assert done.returncode == 0, (command, done.stderr)
+		names += ["byid", "dyn"]
 		before = {name: fetch(name).attrs for name in names}
 		publish("2")
 		found = {}
@@ -1036,10 +1214,19 @@ def test_docker_run_oddities_survive_their_update():
 			result, errors = update(fetch(name))
 			assert result == "updated_container", (name, result, errors)
 			after = fetch(name)
-			diff = differences(before[name], after.attrs, allowed=(
+			diff = differences(before[name], carried_anonymous_mounts(before[name], after.attrs), allowed=(
+				# Docker's on a network without a fixed address, which Docker 25
+				# to 27 make from an address that may have changed (dyn's own
+				# is looked at below).
+				*((f"NetworkSettings.Networks.{PREFIX}dyn.MacAddress", f"NetworkSettings.Networks.{PREFIX}gwb.MacAddress")
+				  if name in ("dyn", "byid") else ()),
 				"Config.AttachStdout", "Config.AttachStderr", "Config.Hostname",
 				# Docker's own MAC on the default bridge.
 				"NetworkSettings.Networks.bridge.MacAddress",
+				# The same MAC as the default bridge's, where Docker before 29
+				# repeats it: one Docker assigned is assigned anew on Docker 25
+				# to 28, which would otherwise pin it as if set by hand.
+				"NetworkSettings.MacAddress",
 				f"NetworkSettings.Networks.{PREFIX}gwa.MacAddress",
 				# The CLI consumes systempaths=unconfined; MaskedPaths carries it.
 				"HostConfig.SecurityOpt"))
@@ -1048,6 +1235,23 @@ def test_docker_run_oddities_survive_their_update():
 		assert not found, "\n".join(f"{n}:\n" + "\n".join(f"  {k}: {a!r} -> {b!r}" for k, (a, b) in d.items())
 									for n, d in found.items())
 		assert fetch("paused").status == "paused"
+		# Docker 25 to 27 make the MAC from the address, whichever it got.
+		dyn = fetch("dyn").attrs["NetworkSettings"]["Networks"][f"{PREFIX}dyn"]
+		if not docker.utils.version_lt(client.api._version, "1.44") and docker.utils.version_lt(client.api._version, "1.48"):
+			assert docker_update._derived_from_ipv4(dyn["MacAddress"], dyn), dyn
+		# On two networks Docker gives its mode as the full id, and lists the
+		# first under the short id and under its name: it came back connected
+		# to the second after the create, which Docker 25 to 28 do without the
+		# MAC asked for, and the first lost its gateway priority.
+		result, errors = update(fetch("byshort"))
+		assert result == "updated_container", (result, errors)
+		byshort = fetch("byshort")
+		assert byshort.status == "running"
+		networks = byshort.attrs["NetworkSettings"]["Networks"]
+		assert networks[f"{PREFIX}short2"]["MacAddress"] == "02:aa:00:00:02:40", networks
+		assert networks[f"{PREFIX}short"]["IPAMConfig"]["IPv4Address"] == "172.31.234.30", networks
+		if gateway_priorities:
+			assert networks[f"{PREFIX}short"].get("GwPriority") == 10, networks
 	finally:
 		cleanup()
 
@@ -1185,7 +1389,9 @@ def test_the_event_monitor_says_why_a_container_stopped_and_when_it_is_unhealthy
 			return client.containers.run(BASE, command, name=PREFIX + name, detach=True, labels=LABEL, **kwargs)
 		go("finishes", ["sh", "-c", "sleep 1; exit 0"])
 		go("fails", ["sh", "-c", "echo 'ERROR: <sin base de datos>' >&2; sleep 1; exit 3"])
-		go("oom", ["sh", "-c", "sleep 1; tail /dev/zero"], mem_limit="8m", memswap_limit="8m")
+		# 8m was too little for runc itself on a loaded machine, and the
+		# container never started.
+		go("oom", ["sh", "-c", "sleep 1; tail /dev/zero"], mem_limit="32m", memswap_limit="32m")
 		stopped = go("stopped", ["sleep", "300"])
 		sick = go("sick", ["sh", "-c", "touch /ok; sleep 300"],
 					healthcheck={"test": ["CMD", "test", "-f", "/ok"], "interval": 1_000_000_000, "retries": 2})
@@ -1205,7 +1411,15 @@ def test_the_event_monitor_says_why_a_container_stopped_and_when_it_is_unhealthy
 		assert (core.get_text("container_finished", name("finishes")), None) in said["finishes"], said
 		failed = [m for m in said["fails"] if m[0] == core.get_text("container_failed", name("fails"), "3")]
 		assert failed and "ERROR: &lt;sin base de datos&gt;" in failed[0][1], said["fails"]
-		assert (core.get_text("container_oom", name("oom")), None) in said["oom"], said["oom"]
+		# On a loaded machine Docker can lose the "oom" altogether, and then
+		# it does not know either: State.OOMKilled comes from that event.
+		if client.api.inspect_container(name("oom"))["State"]["OOMKilled"]:
+			assert (core.get_text("container_oom", name("oom")), None) in said["oom"], said["oom"]
+		else:
+			# Its start is announced too: what is checked is how it ended.
+			killed = core.get_text("container_failed", name("oom"), "137 (SIGKILL)")
+			started = core.get_text("started_container", name("oom"))
+			assert [m for m, _ in said["oom"] if m != started] == [killed], said["oom"]
 		assert (core.get_text("stopped_container", name("stopped")), None) in said["stopped"], said["stopped"]
 		health = [m for m, _ in said["sick"] if "sick" in m and "🟢" not in m]
 		assert health == [core.get_text("container_unhealthy", name("sick")),
@@ -1275,22 +1489,182 @@ volumes:
 								privileged=True)
 		time.sleep(4)
 		owner = core.manager(core.host_registry.local_host_id())
-		plex, _, can_start = owner.get_info(fetch("plex").id, PREFIX + "plex")
+		plex, _, can_start, gathered = owner.get_info(fetch("plex").id, PREFIX + "plex")
 		assert not can_start
+		# What it does with a new version is on its button now, not in the text.
+		assert (gathered["update_mode"], gathered["update_mode_label"]) == ("auto", core.LABEL_AUTO_UPDATE), gathered
 		for expected in ("💚", "<code>1.4.2</code>", f"({core.get_text('info_limit')}: 2 CPU)",
 							"/ 256.0 MiB", "55201 → 32400/tcp", f"<code>{PREFIX}cfg</code> → <code>/config</code>",
-							"<code>tmpfs</code> → <code>/transcode</code>", "<code>db</code>", "<code>overseerr</code>",
-							core.get_text("schedule_yes")):
+							"<code>tmpfs</code> → <code>/transcode</code>", "<code>db</code>", "<code>overseerr</code>"):
 			assert expected in plex, (expected, plex)
-		qb, _, can_start = owner.get_info(fetch("qb").id, PREFIX + "qb")
+		qb, _, can_start, _ = owner.get_info(fetch("qb").id, PREFIX + "qb")
 		assert can_start
 		for expected in (core.get_text("info_oom"), "137 (SIGKILL)", f"<code>{PREFIX}vpn</code>",
 							core.get_text("info_privileged"), "RAM 8.0 MiB"):
 			assert expected in qb, (expected, qb)
-		vpn_info, _, _ = owner.get_info(vpn.id, vpn.name)
+		vpn_info, _, _, _ = owner.get_info(vpn.id, vpn.name)
 		assert f"{core.get_text('info_network_shared_by')}: <code>{PREFIX}qb</code>" in vpn_info, vpn_info
 	finally:
 		cleanup()
+
+
+def test_one_pass_updates_what_is_set_to_on_its_own_in_one_batch():
+	"""
+	What each container does with a new version, against a real daemon. Two
+	update on their own —one set from the bot, one by its label—, one is left
+	to say so and one is not checked, each on an image of its own with a new
+	version published. One pass: the two go in a single batch with a single
+	summary, before the message with buttons; the one to say so is announced
+	and left as it was; the ignored one is left alone. And what was set from
+	the bot outlives the update, which recreated the container.
+	"""
+	_setup()
+	core, sent = _load()
+	local = core.host_registry.local_host_id()
+	names = ("auto", "label", "tell", "ignored")
+	images = {name: f"{REGISTRY}/dcbtest/{name}" for name in names}
+	original = core.DockerManager.list_containers
+	# The pass looks at every container on the host: only these, here.
+	core.DockerManager.list_containers = lambda self, *a, **k: [
+		c for c in original(self, *a, **k) if c.name.startswith(PREFIX)]
+	try:
+		old = {}
+		for name in names:
+			old[name] = publish("1", image=images[name])
+			labels = dict(LABEL, **({"DCB-Auto-Update": ""} if name == "label" else {}))
+			client.containers.run(f"{images[name]}:latest", name=PREFIX + name, detach=True, labels=labels)
+		assert core.set_update_mode(local, PREFIX + "auto", {}, f"{images['auto']}:latest", "auto") is None
+		assert core.set_update_mode(local, PREFIX + "ignored", {}, f"{images['ignored']}:latest", "ignore") is None
+		new = {name: publish("2", image=images[name]) for name in names}
+
+		core.DockerUpdateMonitor()._check_fleet(cold_cache=False)
+
+		assert (fetch("auto").image.id, fetch("label").image.id) == (new["auto"], new["label"]), sent
+		assert (fetch("tell").image.id, fetch("ignored").image.id) == (old["tell"], old["ignored"]), sent
+		assert all(fetch(name).status == "running" for name in names)
+		summaries = [i for i, message in enumerate(sent) if core.get_text("updated_batch", 2, 2) in (message or "")]
+		announces = [i for i, message in enumerate(sent) if core.get_text("available_updates", 1) in (message or "")]
+		assert len(summaries) == 1 and len(announces) == 1 and summaries[0] < announces[0], sent
+		assert PREFIX + "auto" in sent[summaries[0]] and PREFIX + "label" in sent[summaries[0]]
+		assert core.store.container_update_mode(local, PREFIX + "auto") == "auto", "se perdió al recrearlo"
+		assert [name for _, name in core.pending_updates()] == [PREFIX + "tell"]
+	finally:
+		core.DockerManager.list_containers = original
+		core.store.forget_host_containers(local)
+		cleanup()
+
+
+def test_unraid_is_told_through_a_helper_that_never_starts():
+	"""
+	What unraid.py writes, written by Docker itself: a helper created and never
+	started, the files read and written through the API `docker cp` uses.
+	Unraid's directories are temporary ones here, and the host is taken for
+	Unraid; the rest is as on a real one, image VOLUME included.
+	"""
+	import json
+	import shutil
+
+	import unraid
+
+	_setup()
+	status_dir, info_dir = tempfile.mkdtemp(), tempfile.mkdtemp()
+	saved = unraid.STATUS_DIR, unraid.INFO_DIR, unraid.is_unraid
+	try:
+		publish("1", "VOLUME /db")
+		container = run("unraid", labels={unraid.MANAGED_LABEL: unraid.MANAGED_BY_UNRAID})
+		key = f"{IMAGE}:latest"
+		old = "sha256:" + "0" * 64
+		other = {"local": old, "remote": old, "status": "true"}
+		with open(os.path.join(status_dir, unraid.STATUS_FILE), "w") as f:
+			json.dump({key: {"local": old, "remote": "sha256:" + "1" * 64, "status": "false"},
+						"lscr.io/linuxserver/plex:latest": other}, f, indent=4)
+		with open(os.path.join(info_dir, unraid.INFO_FILE), "w") as f:
+			json.dump({container.name: {"updated": "false"}, "plex": {"updated": "true"}}, f, indent=4)
+		volumes_before = {v.name for v in client.volumes.list()}
+
+		unraid.STATUS_DIR, unraid.INFO_DIR = status_dir, info_dir
+		unraid.is_unraid = lambda client: True
+		logged = []
+		unraid.sync_after_update(client, "h_local", fetch("unraid"), logged.append)
+
+		digest = unraid.pulled_digest(client.images.get(container.image.id).attrs["RepoDigests"], key)
+		assert digest, logged
+		with open(os.path.join(status_dir, unraid.STATUS_FILE)) as f:
+			status = json.load(f)
+		assert status[key] == {"local": digest, "remote": digest, "status": "true"}, (status, logged)
+		assert status["lscr.io/linuxserver/plex:latest"] == other
+		with open(os.path.join(info_dir, unraid.INFO_FILE)) as f:
+			assert json.load(f) == {"plex": {"updated": "true"}}, logged
+		assert not [c.name for c in client.containers.list(all=True) if c.name.startswith(unraid.HELPER_PREFIX)]
+		# The image's VOLUME got a tmpfs, not an anonymous volume left behind.
+		assert {v.name for v in client.volumes.list()} == volumes_before
+		events = client.events(since=int(time.time()) - 60, until=int(time.time()) + 1, decode=True,
+								filters={"type": "container", "label": f"{unraid.HELPER_LABEL}={unraid.HELPER_KIND}"})
+		actions = {event.get("Action") for event in events}
+		assert "create" in actions and "destroy" in actions and "start" not in actions, actions
+	finally:
+		unraid.STATUS_DIR, unraid.INFO_DIR, unraid.is_unraid = saved
+		shutil.rmtree(status_dir, ignore_errors=True)
+		shutil.rmtree(info_dir, ignore_errors=True)
+		cleanup()
+
+
+def test_the_monitor_hears_through_its_filter_what_it_reads():
+	"""
+	The event stream asks the daemon only for MONITORED_EVENTS. A filter that
+	left one out would be silence nothing complains about, so this runs the
+	monitor itself against the daemon: every action it reads has to arrive,
+	healthchecks included, and none of their exec events. And the level comes
+	from the label inside each event: a container that only notifies problems
+	says it is unhealthy but not that it started or was stopped, and one that
+	notifies nothing says nothing, not even that it ran out of memory.
+	"""
+	core, _sent = _load()
+	host_registry = core.host_registry
+	saved_hosts = core.store.get("hosts")
+	core.store.set("hosts", [{"id": "h_local", "alias": "test", "local": True,
+							   "url": os.environ.get("DOCKER_HOST") or host_registry.LOCAL_SOCKET_URL}])
+	host_registry.reset()
+	monitor = core.DockerEventMonitor("h_local")
+	announced, received = [], []
+	monitor._announce = lambda message, detail=None: announced.append(message)
+	handle = monitor._handle_event
+	monitor._handle_event = lambda event: received.append(event.get("Action", "")) or handle(event)
+	thread = threading.Thread(target=monitor.detectar_eventos_contenedores, daemon=True)
+	thread.start()
+	time.sleep(1)
+	try:
+		plain = client.containers.run(BASE, ["sh", "-c", "trap 'exit 0' TERM; sleep 3600 & wait"],
+									  name=f"{PREFIX}ev-plain", detach=True, labels=LABEL)
+		problems = client.containers.run(
+			BASE, ["sh", "-c", "touch /ok; sleep 4; rm /ok; trap 'exit 0' TERM; sleep 3600 & wait"],
+			name=f"{PREFIX}ev-problems", detach=True, labels=dict(LABEL, **{"DCB-Notifications": "problems"}),
+			healthcheck={"test": ["CMD-SHELL", "test -f /ok"], "interval": 1_000_000_000, "retries": 1})
+		quiet = client.containers.run(BASE, ["sh", "-c", "x=a; while true; do x=$x$x; done"],
+									  name=f"{PREFIX}ev-quiet", detach=True, mem_limit="8m", memswap_limit="8m",
+									  labels=dict(LABEL, **{"DCB-Notifications": "none"}))
+		deadline = time.time() + 30
+		while time.time() < deadline and core.get_text("container_unhealthy", problems.name) not in announced:
+			time.sleep(0.5)
+		plain.stop(timeout=5)
+		problems.stop(timeout=5)
+		time.sleep(3)
+	finally:
+		monitor.stop()
+		thread.join(10)
+		cleanup()
+		core.store.set("hosts", saved_hosts)
+		host_registry.reset()
+
+	actions = {action.split(":")[0] for action in received}
+	assert actions <= set(core.MONITORED_EVENTS), actions
+	assert {"create", "start", "kill", "die", "oom", "health_status"} <= actions, actions
+	assert not [a for a in received if a.startswith("exec_")], received
+	assert core.get_text("started_container", plain.name) in announced, announced
+	assert core.get_text("stopped_container", plain.name) in announced, announced
+	assert core.get_text("container_unhealthy", problems.name) in announced, announced
+	assert not [m for m in announced if problems.name in m and m != core.get_text("container_unhealthy", problems.name)], announced
+	assert not [m for m in announced if quiet.name in m], announced
 
 
 def test_zz_the_registry_goes_when_the_tests_are_done():

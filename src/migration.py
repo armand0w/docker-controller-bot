@@ -1,0 +1,272 @@
+"""
+One-time migrations, run at startup before anything reads a setting.
+
+Updating from 4.x has to be a no-op from the user's side: the settings file is
+seeded from the environment variables already in their compose, so every value
+they had is the value they keep. What changes is where those values live from
+then on.
+
+Running this again on an already-migrated install is safe: the seeding is
+skipped outright, and every other step is idempotent.
+"""
+
+import json
+import os
+import shutil
+import uuid
+from collections import namedtuple
+
+import store
+from config import HOST_SCOPED_SCHEDULE_ACTIONS, SETTINGS_FROM_ENV
+from logger import debug, error, warning
+
+# Directory 4.x wrote its pickled update cache into, relative to the working
+# directory. It was never part of a mapped volume.
+LEGACY_CACHE_DIR = "./cache/"
+
+LOCAL_SOCKET_URL = "unix:///var/run/docker.sock"
+
+# What the startup needs to know once storage is up to date.
+#
+# `ask_for_language` is true only on a genuinely new install: one where there
+# were no settings to read, no LANGUAGE to import and nothing left by 4.x, so
+# the bot has no way of knowing which language to speak and may as well ask.
+#
+# `imported` lists the variables this start copied into the settings file, and
+# `ignored` the ones still in the compose whose value is no longer the one in
+# force. The start message tells the user about both, because the log is not
+# where anyone looks after an upgrade.
+MigrationResult = namedtuple("MigrationResult", ["host_id", "ask_for_language", "imported", "ignored"])
+
+
+def run():
+	"""
+	Brings storage up to date.
+
+	Only the seeding is guarded against running twice, because it is the one
+	step that would be destructive if repeated: it would overwrite whatever the
+	user has since changed from /settings. The rest are idempotent and run on
+	every start, so nothing can be left half done if the container is killed
+	during the first one.
+	"""
+	store.init()
+	# Looked at before anything below writes: 4.x left schedules.json in its
+	# volume on every start, so finding one means this is an upgrade even
+	# when there are no settings yet. Such a user has been reading the bot in
+	# Spanish, the 4.x default, and a language picker with no way back is not
+	# what they should meet on their first start of 5.0.
+	upgrading = store.uses_legacy_root() or os.path.isfile(store.schedules_path())
+	seeded = _seed_settings_from_env()
+	host_id = _ensure_local_host()
+	imported = _present_env() if seeded else []
+	ignored = [] if seeded else _overridden_env()
+	_warn_deprecated_env(seeded)
+	_migrate_schedules(host_id)
+	_discard_legacy_cache()
+	ask_for_language = seeded and not upgrading and not os.environ.get("LANGUAGE")
+	return MigrationResult(host_id=host_id, ask_for_language=ask_for_language,
+							imported=imported, ignored=ignored)
+
+
+def _seed_settings_from_env():
+	"""
+	Writes the settings file from the environment the first time only.
+
+	Returns True when it seeded, False when a settings file already existed.
+	After the first run the environment is ignored, so this must not overwrite
+	anything: a user who changed a setting from Telegram would see it revert on
+	the next restart.
+	"""
+	if store.settings_exists():
+		return False
+
+	with store.batch():
+		for variable, (key, parse) in SETTINGS_FROM_ENV.items():
+			raw = os.environ.get(variable)
+			if raw is None or raw == "":
+				continue
+			try:
+				store.set(key, parse(raw))
+			except (TypeError, ValueError):
+				warning(f"Ignoring {variable}={raw!r}: not a valid value for {key}")
+
+		# Touch the file even when the compose set nothing, so the next start
+		# knows the seeding already happened and does not try again.
+		store.set("settings_version", 1)
+	debug(f"Settings file created at {store.settings_path()}")
+	return True
+
+
+def _ensure_local_host():
+	"""
+	Makes sure the local Docker socket is registered as a host, and returns its
+	id.
+
+	The id is generated once and never changes. Cache entries and schedules are
+	keyed on it rather than on the alias precisely so that renaming a host, or
+	moving it from one connection URL to another, does not orphan them.
+	"""
+	hosts = store.get("hosts") or []
+	for host in hosts:
+		if isinstance(host, dict) and host.get("local") and host.get("id"):
+			return host["id"]
+
+	host_id = _generate_host_id(hosts)
+	hosts.append({
+		"id": host_id,
+		"alias": "local",
+		"url": LOCAL_SOCKET_URL,
+		"local": True,
+	})
+	store.set("hosts", hosts)
+	debug(f"Registered the local Docker host as {host_id}")
+	return host_id
+
+
+def _generate_host_id(hosts):
+	"""A short id that no existing host is using."""
+	taken = {host.get("id") for host in hosts if isinstance(host, dict)}
+	while True:
+		candidate = f"h_{uuid.uuid4().hex[:4]}"
+		if candidate not in taken:
+			return candidate
+
+
+def _present_env():
+	"""The settings variables the compose sets, in the order they are documented."""
+	return [name for name in SETTINGS_FROM_ENV if os.environ.get(name) not in (None, "")]
+
+
+def _overridden_env():
+	"""
+	The settings variables the compose sets to something other than what is in
+	force.
+
+	One that matches is harmless and is left alone: the trap is the user who
+	edits the compose, restarts, and sees nothing change. A value that does not
+	even parse counts as not matching, since it is not applied either.
+	"""
+	overridden = []
+	for name in _present_env():
+		key, parse = SETTINGS_FROM_ENV[name]
+		try:
+			matches = parse(os.environ[name]) == store.get(key)
+		except (TypeError, ValueError):
+			matches = False
+		if not matches:
+			overridden.append(name)
+	return overridden
+
+
+def _warn_deprecated_env(seeded):
+	"""
+	Reports variables that no longer do anything.
+
+	Staying quiet would be worse than noisy: the user edits the compose,
+	restarts, sees no change, and has no way of knowing the value is now read
+	from somewhere else.
+	"""
+	present = _present_env()
+	if not present:
+		return
+	if seeded:
+		debug(f"Imported into {store.settings_path()}: {', '.join(present)}. They can be removed from the compose.")
+		return
+	warning(
+		f"These variables are no longer read and can be removed from the compose: {', '.join(present)}. "
+		f"Their values are now managed with /settings."
+	)
+
+
+def _migrate_schedules(local_host_id):
+	"""
+	Puts every task's host right.
+
+	A task that acts on Docker says which container by name, and a name is
+	only unique within one daemon. Left blank it would be ambiguous the moment
+	a second host is added, so tasks that predate hosts are pinned to the
+	machine they were created for, which is the local one.
+
+	And it clears the host from a mute task. Muting is the bot's own
+	notifications, so it belongs to no machine — an earlier version of this
+	stamped one onto every task alike, and the listing then claimed a mute ran
+	somewhere in particular.
+	"""
+	path = store.schedules_path()
+	if not os.path.isfile(path):
+		return
+
+	try:
+		with open(path, "r", encoding="utf-8") as handle:
+			document = json.load(handle)
+	except Exception as e:
+		warning(f"Could not read {path} to migrate schedules: {e}")
+		return
+
+	# Valid JSON is not yet a schedules file. This runs while core is being
+	# imported, so a `[]` or a `null` raising here stopped the bot from
+	# starting at all; left as it is, ScheduleManager sets it aside like any
+	# other file it cannot read, and says so.
+	if not isinstance(document, dict):
+		warning(f"{path} does not hold a schedules document, leaving it as it is")
+		return
+
+	schedules = document.get("schedules")
+	if not isinstance(schedules, list):
+		return
+
+	stamped = cleared = 0
+	for schedule in schedules:
+		if not isinstance(schedule, dict):
+			continue
+		# Hand-edited, the action can be anything JSON holds, and a list or an
+		# object cannot even be looked up in a set. No action the bot knows is
+		# one of those, so it is no host's.
+		action = schedule.get("action")
+		# Lowercased, as the scheduler reads it: a hand-written "Restart" is a
+		# restart, and left without a host it could not run.
+		host_scoped = isinstance(action, str) and action.strip().lower() in HOST_SCOPED_SCHEDULE_ACTIONS
+		if host_scoped and not schedule.get("host"):
+			schedule["host"] = local_host_id
+			stamped += 1
+		elif not host_scoped and schedule.get("host"):
+			schedule["host"] = None
+			cleared += 1
+	if not stamped and not cleared:
+		return
+
+	# Through the store's writer, flushed and synced before the rename: what a
+	# power cut at the wrong moment would cost here is every task there is.
+	try:
+		store.write_document(path, document)
+	except Exception as e:
+		# Not a reason not to start. The scheduler leaves out a task with no
+		# host and says so, and this runs again on the next start.
+		warning(f"Could not write {path} to migrate schedules: {e}")
+		return
+	if stamped:
+		debug(f"Pinned {stamped} existing schedules to the local host")
+	if cleared:
+		debug(f"Cleared the host from {cleared} schedules that do not act on a host")
+
+
+def _discard_legacy_cache():
+	"""
+	Removes the 4.x pickled update cache.
+
+	It is not migrated, for two reasons. It lived outside any mapped volume, so
+	on most installs it was already being lost on every container recreation;
+	and it stored the *translated* status message rather than a boolean, which
+	made the entries unreadable as soon as the language changed. The first check
+	cycle rebuilds it, silently, because a cold cache means those updates are
+	pre-existing rather than new.
+	"""
+	if not os.path.isdir(LEGACY_CACHE_DIR):
+		return
+	try:
+		discarded = len(os.listdir(LEGACY_CACHE_DIR))
+		shutil.rmtree(LEGACY_CACHE_DIR)
+		if discarded:
+			debug(f"Discarded {discarded} entries of the 4.x update cache. It will be rebuilt on the next check.")
+	except OSError as e:
+		error(f"Could not remove the old cache directory {LEGACY_CACHE_DIR}: {e}")

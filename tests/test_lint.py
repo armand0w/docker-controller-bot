@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
 
 # Every module of the bot, and what each may legitimately read from elsewhere.
-SOURCES = ("core.py", "commands.py", "callbacks.py", "i18n.py",
-			"store.py", "migration.py", "callback_registry.py",
+SOURCES = ("core.py", "commands.py", "callbacks.py", "schedules.py", "schedule_manager.py", "i18n.py",
+			"store.py", "migration.py", "callback_registry.py", "dcb_mute.py",
 			"host_registry.py", "container_listing.py", "formatting.py",
 			"docker-controller-bot.py")
 
@@ -62,11 +62,11 @@ def _module_globals(tree, extra):
 
 
 def test_no_function_reads_a_name_its_module_does_not_define():
-	sys.path.insert(0, harness.REPO)
+	sys.path.insert(0, harness.SRC)
 	problems = []
 
 	for filename in SOURCES:
-		path = os.path.join(harness.REPO, filename)
+		path = os.path.join(harness.SRC, filename)
 		source = io.open(path, encoding="utf-8").read()
 		known = _module_globals(ast.parse(source), extra=())
 
@@ -91,15 +91,15 @@ def test_the_entry_point_imports_everything_that_registers():
 	Commands and callbacks register by being imported. If the entry point stops
 	importing one of them the bot starts fine and half its buttons do nothing.
 	"""
-	path = os.path.join(harness.REPO, "docker-controller-bot.py")
+	path = os.path.join(harness.SRC, "docker-controller-bot.py")
 	source = io.open(path, encoding="utf-8").read()
-	for module in ("core", "commands", "callbacks"):
+	for module in ("core", "commands", "callbacks", "schedules"):
 		assert f"import {module}" in source, f"el punto de entrada no importa {module}"
 
 
 def test_the_registrars_are_the_ones_the_tests_load():
 	"""The harness has to load what the entry point loads, or it tests less."""
-	path = os.path.join(harness.REPO, "docker-controller-bot.py")
+	path = os.path.join(harness.SRC, "docker-controller-bot.py")
 	source = io.open(path, encoding="utf-8").read()
 	imported = {line.split()[1] for line in source.split("\n")
 				if line.startswith("import ") and not line.startswith("import core")}
@@ -146,7 +146,7 @@ def _locale_strings():
 	import glob
 	import json
 
-	for path in sorted(glob.glob(os.path.join(harness.REPO, "locale", "*.json"))):
+	for path in sorted(glob.glob(os.path.join(harness.SRC, "locale", "*.json"))):
 		with io.open(path, encoding="utf-8") as handle:
 			for key, value in json.load(handle).items():
 				if isinstance(value, str):
@@ -184,6 +184,34 @@ def test_no_string_uses_a_character_with_no_emoji_form():
 	assert not problems, "caracteres sin forma emoji:\n" + "\n".join(sorted(set(problems)))
 
 
+# The tags Telegram's HTML knows, the same as test_bot's _assert_telegram_html.
+TELEGRAM_TAGS = ("b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "a",
+					"tg-spoiler", "span", "blockquote")
+
+
+def test_no_text_has_a_stray_angle_bracket():
+	"""
+	ru.json said `<минуты>` where the other seven say `&lt;…&gt;`: with the bot
+	in Russian, `/mute abc` was refused by Telegram and the user got no answer
+	at all. Every text goes out as HTML, and any `<` that does not open one of
+	its tags makes Telegram refuse the whole message.
+
+	Except the menu_* ones, which are the command descriptions: BotCommand
+	takes plain text, and an entity there would show as typed.
+	"""
+	import re
+
+	tag = re.compile(r"</?(?:%s)(?:\s[^>]*)?>" % "|".join(sorted(TELEGRAM_TAGS, key=len, reverse=True)))
+	problems = []
+	for filename, key, value in _locale_strings():
+		if key.startswith("menu_"):
+			continue
+		if "<" in tag.sub("", value):
+			problems.append(f"  {filename}: {key}")
+
+	assert not problems, "«<» sin escapar:\n" + "\n".join(problems)
+
+
 # Callbacks whose argument is a container. Their buttons have to carry a
 # reference, not a bare short id: five hex characters name a different
 # container on another host, so a bare id resolves against the local machine
@@ -192,7 +220,7 @@ CONTAINER_CALLBACKS = (
 	"run", "stop", "restart", "confirmDelete", "delete", "logs", "logfile",
 	"info", "compose", "checkUpdate", "confirmUpdate", "update",
 	"changeTagContainer", "changeTag", "askCommand", "exec", "cancelExec",
-	"toggleUpdate",
+	"toggleUpdate", "infoSetUpdates",
 )
 
 # How a reference is built. Anything interpolated into a container callback
@@ -238,8 +266,8 @@ def test_container_buttons_never_carry_a_bare_id():
 	# that only read double quotes was blind to eight `callback_data` lines —
 	# two of them container buttons, which is how /updateall shipped bare ids.
 	pattern = re.compile(r"""callback_data=f?(['"])([^'"]*)\1""")
-	for filename in ("core.py", "commands.py", "callbacks.py"):
-		path = os.path.join(harness.REPO, filename)
+	for filename in ("core.py", "commands.py", "callbacks.py", "schedules.py"):
+		path = os.path.join(harness.SRC, filename)
 		source = io.open(path, encoding="utf-8").read()
 		lines = source.splitlines()
 		spans = _function_spans(ast.parse(source))
@@ -338,8 +366,8 @@ def test_a_message_that_was_never_sent_is_not_dereferenced():
 	the guard the manual commands had was missing there.
 	"""
 	problems = []
-	for filename in ("core.py", "commands.py", "callbacks.py"):
-		path = os.path.join(harness.REPO, filename)
+	for filename in ("core.py", "commands.py", "callbacks.py", "schedules.py"):
+		path = os.path.join(harness.SRC, filename)
 		tree = ast.parse(io.open(path, encoding="utf-8").read())
 		parents = _parents(tree)
 		for function in ast.walk(tree):
@@ -423,8 +451,8 @@ def test_a_message_about_one_host_says_which():
 
 	problems = []
 	key_pattern = re.compile(r"""get_text\(\s*['"]([a-z_]+)['"]""")
-	for filename in ("core.py", "commands.py", "callbacks.py"):
-		path = os.path.join(harness.REPO, filename)
+	for filename in ("core.py", "commands.py", "callbacks.py", "schedules.py"):
+		path = os.path.join(harness.SRC, filename)
 		source = io.open(path, encoding="utf-8").read()
 		tree = ast.parse(source)
 		spans = _function_spans(tree)
@@ -461,7 +489,8 @@ def test_a_message_about_one_host_says_which():
 # a dependency is something a static check can actually see.
 LOCK_HOLDERS = {
 	"host_registry.py": {"store", "logger", "docker", "paramiko", "shutil",
-							"threading", "time", "uuid", "json", "os"},
+							"threading", "time", "uuid", "json", "os",
+							"io", "select", "socket"},
 }
 
 
@@ -475,7 +504,7 @@ def test_the_module_that_locks_last_depends_on_nothing_above_it():
 	"""
 	problems = []
 	for filename, allowed in LOCK_HOLDERS.items():
-		path = os.path.join(harness.REPO, filename)
+		path = os.path.join(harness.SRC, filename)
 		tree = ast.parse(io.open(path, encoding="utf-8").read())
 		for node in ast.walk(tree):
 			if isinstance(node, ast.Import):
@@ -503,7 +532,7 @@ def test_nothing_the_bot_starts_outlives_it():
 	"""
 	problems = []
 	for filename in SOURCES:
-		path = os.path.join(harness.REPO, filename)
+		path = os.path.join(harness.SRC, filename)
 		source = io.open(path, encoding="utf-8").read()
 		tree = ast.parse(source)
 		spans = _function_spans(tree)
@@ -545,7 +574,7 @@ def test_a_shadowed_builtin_is_never_called_before_its_definition():
 	names = set(dir(builtins_module))
 	problems = []
 	for filename in SOURCES:
-		path = os.path.join(harness.REPO, filename)
+		path = os.path.join(harness.SRC, filename)
 		tree = ast.parse(io.open(path, encoding="utf-8").read())
 		defined_at = {node.name: node.lineno for node in tree.body
 						if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -579,8 +608,8 @@ def test_the_crown_is_always_asked_about_a_host():
 	import re
 
 	problems = []
-	for filename in ("core.py", "commands.py", "callbacks.py"):
-		path = os.path.join(harness.REPO, filename)
+	for filename in ("core.py", "commands.py", "callbacks.py", "schedules.py"):
+		path = os.path.join(harness.SRC, filename)
 		source = io.open(path, encoding="utf-8").read()
 		for node in ast.walk(ast.parse(source)):
 			if not isinstance(node, ast.Call):
@@ -623,7 +652,7 @@ def test_a_loop_that_waits_waits_on_every_lap():
 	"""
 	problems = []
 	for filename in SOURCES:
-		path = os.path.join(harness.REPO, filename)
+		path = os.path.join(harness.SRC, filename)
 		source = io.open(path, encoding="utf-8").read()
 		for node in ast.walk(ast.parse(source)):
 			if not isinstance(node, ast.While):
@@ -655,7 +684,7 @@ def test_no_module_imports_a_name_it_never_uses():
 	"""
 	problems = []
 	for filename in SOURCES:
-		path = os.path.join(harness.REPO, filename)
+		path = os.path.join(harness.SRC, filename)
 		source = io.open(path, encoding="utf-8").read()
 		tree = ast.parse(source)
 		lines = source.splitlines()
@@ -690,6 +719,10 @@ def test_no_module_imports_a_name_it_never_uses():
 		"imports que nadie lee:\n" + "\n".join(problems))
 
 
+# The release image, and the two for development.
+DOCKERFILES = ("Dockerfile", "dev/Dockerfile_debug", "dev/Dockerfile_local")
+
+
 def test_every_image_logs_as_it_goes():
 	"""
 	Without a TTY, Python holds stdout in a buffer, and every debug() line sat
@@ -697,27 +730,26 @@ def test_every_image_logs_as_it_goes():
 	out at once) and the bot's own lines stopped hours before. A container that
 	is stopped loses whatever is still in the buffer.
 	"""
-	for name in ("Dockerfile", "Dockerfile_debug", "Dockerfile_local"):
+	for name in DOCKERFILES:
 		with open(os.path.join(harness.REPO, name), encoding="utf-8") as f:
 			assert "PYTHONUNBUFFERED=1" in f.read(), f"{name} no lleva PYTHONUNBUFFERED=1"
 
 
 def test_the_image_ships_every_module():
 	"""
-	All three Dockerfiles name the modules one by one, and a new one is easy
-	to forget. Only the release one was checked, and formatting.py was left
-	out of the local and debug images: they would have started and crashed.
+	All three Dockerfiles named the modules one by one, and a new one was easy
+	to forget: formatting.py was left out of the local and debug images, which
+	would have started and crashed. Now they take src/ whole, and this checks
+	that they still do, and that src/ is where the code is.
 	"""
-	modules = [n for n in os.listdir(harness.REPO) if n.endswith(".py")]
+	modules = [n for n in os.listdir(harness.SRC) if n.endswith(".py")]
+	assert "docker-controller-bot.py" in modules and "core.py" in modules, modules
+	assert not [n for n in os.listdir(harness.REPO) if n.endswith(".py")], "hay código fuera de src/"
 	with open(os.path.join(harness.REPO, "Dockerfile"), encoding="utf-8") as f:
-		dockerfile = f.read()
-	missing = [n for n in modules if f"/{n} /app" not in dockerfile]
-	assert not missing, f"el Dockerfile no copia: {missing}"
-	for name in ("Dockerfile_local", "Dockerfile_debug"):
+		assert "/src/* /app" in f.read(), "el Dockerfile no copia src/ entero"
+	for name in DOCKERFILES[1:]:
 		with open(os.path.join(harness.REPO, name), encoding="utf-8") as f:
-			copied = " ".join(line for line in f if line.startswith("COPY")).split()
-		missing = [n for n in modules if n not in copied]
-		assert not missing, f"{name} no copia: {missing}"
+			assert "COPY src/ /app/" in f.read(), f"{name} no copia src/ entero"
 
 
 def test_no_text_is_handed_more_values_than_it_shows():
@@ -729,11 +761,11 @@ def test_no_text_is_handed_more_values_than_it_shows():
 	import json
 	import re
 
-	with open(os.path.join(harness.REPO, "locale", "es.json"), encoding="utf-8") as f:
+	with open(os.path.join(harness.SRC, "locale", "es.json"), encoding="utf-8") as f:
 		texts = json.load(f)
 	problems = []
 	for filename in SOURCES + ("schedule_manager.py",):
-		path = os.path.join(harness.REPO, filename)
+		path = os.path.join(harness.SRC, filename)
 		for node in ast.walk(ast.parse(io.open(path, encoding="utf-8").read())):
 			if not (isinstance(node, ast.Call) and _call_name(node).split(".")[-1] == "get_text"):
 				continue
@@ -753,7 +785,7 @@ def test_no_module_defines_a_function_twice():
 	"""is_valid_cron was written twice in core.py, and only the second one ever ran."""
 	problems = []
 	for filename in SOURCES + ("schedule_manager.py", "docker_update.py"):
-		tree = ast.parse(io.open(os.path.join(harness.REPO, filename), encoding="utf-8").read())
+		tree = ast.parse(io.open(os.path.join(harness.SRC, filename), encoding="utf-8").read())
 		seen = {}
 		for node in tree.body:
 			if isinstance(node, (ast.FunctionDef, ast.ClassDef)):

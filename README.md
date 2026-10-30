@@ -110,8 +110,9 @@ volumes:
 - 📦 **Contenedores:** listar, arrancar, parar, reiniciar y eliminar. Con selección múltiple en `/run`, `/stop` y `/restart`.
 - 🧩 **Compose:** detecta tus proyectos y los agrupa (proyecto → contenedores).
 - 📊 **Diagnóstico:** logs en el chat o como fichero, `exec` dentro del contenedor, puertos e info detallada.
-- 🔄 **Actualizaciones:** te avisa si hay imagen nueva, actualiza uno o todos, cambia de tag (rollback) y auto-actualiza con labels.
-- ⏰ **Automatización:** tareas programadas con cron + silencio temporal con `/mute` + limpieza con `/prune`.
+- 🔄 **Actualizaciones:** te avisa si hay imagen nueva, actualiza uno o todos, cambia de tag (rollback) y deja que elijas, contenedor a contenedor, cuáles se actualizan solos y cuáles no se comprueban.
+- 🔔 **Avisos:** te dice cuándo un contenedor arranca, se para, se cae, se queda sin memoria o falla su healthcheck, y tú eliges de qué te avisa cada uno: todo, solo problemas o nada.
+- ⏰ **Automatización:** tareas programadas con cron + silencio temporal con `/mute` o desde un script con `dcb-mute` + limpieza con `/prune`.
 - 🖥️ **Multi-host y ajustes:** varios servidores desde un solo bot y todo configurable con `/settings`, sin reiniciar.
 
 <details>
@@ -124,6 +125,7 @@ volumes:
 - ✅ Obtener los logs tanto de manera directa como a través de fichero
 - ✅ Extraer el docker-compose de tus contenedores
 - ✅ Notificaciones cuando un contenedor se cae o se inicia
+- ✅ Avisos por contenedor: todos, solo problemas o ninguno, desde `/info`, `/settings` o la label `DCB-Notifications`
 - ✅ Notificaciones cuando un contenedor tiene una actualización pendiente
 - ✅ Actualizaciones de los contenedores
 - ✅ Cambiar el tag (rollback o actualización)
@@ -136,7 +138,7 @@ volumes:
 - ✅ Se identifica a sí mismo sin ayuda: no hay que decirle cómo se llama su contenedor para que sepa no pararse ni eliminarse
 - ✅ Ajustes editables desde el propio bot con `/settings`, sin tocar el docker-compose ni reiniciar
 - ✅ Menú principal por botones en `/start`, agrupado en categorías; los comandos escritos siguen funcionando igual
-- ✅ Silencia las notificaciones de forma temporal
+- ✅ Silencia las notificaciones de forma temporal, también desde un script con `dcb-mute`
 - ✅ Imagen multiarquitectura (amd64, arm64, armv7…) compatible con Raspberry Pi, NAS y servidores estándar
 - ✅ Soporte de idiomas (Spanish, English, Dutch, German, Russian, Galician, Italian, Catalan)
 
@@ -190,6 +192,24 @@ Desde `/schedule` puedes crear tareas que se ejecuten en cron.
 </details>
 
 <details>
+<summary>🔕 Silenciar el bot desde un script</summary>
+
+Un script puede silenciar el bot sin pasar por Telegram, por ejemplo mientras para contenedores para hacer una copia de seguridad:
+
+```sh
+docker exec docker-controller-bot dcb-mute 60   # silencia 60 minutos
+docker exec docker-controller-bot dcb-mute 0    # quita el silencio
+```
+
+- Espera a que el bot lo aplique, un par de segundos, y sale con un código distinto de 0 si no lo ha hecho.
+- Manda el último cambio, venga del script o de `/mute`, sea más largo o más corto.
+- Tiene el mismo límite que `/mute`.
+- Si lo que quieres es que no avisen los contenedores que para tu copia de seguridad, sin callar todo lo demás, ponles «⚠️ Solo problemas»: ver *«De qué avisa cada contenedor»*.
+- Como en la 4.x, también vale escribir a mano en `.muted_until`, dentro del volumen de datos (`/app/config`, o `/app/schedule` si tu instalación aún usa el de la 4.x), el segundo epoch en que termina el silencio, o `0` para quitarlo: `sh -c 'echo $(( $(date +%s) + 3600 )) > /app/config/.muted_until'`. El bot lo aplica redondeado al minuto hacia arriba y lo borra, también si lo encuentra al arrancar.
+
+</details>
+
+<details>
 <summary>⚙️ Configuración avanzada y <code>/settings</code></summary>
 
 Aquí solo quedan las variables que el bot necesita **antes** de poder leer sus propios ajustes: cómo llegar a Telegram y quién puede hablarle. La regla es sencilla: si ponerla mal te puede dejar sin acceso al bot, va en el docker-compose, porque lo que impide que el chat funcione no se puede arreglar desde el chat.
@@ -214,8 +234,9 @@ Todo lo demás se configura desde el propio bot y se guarda en `settings.json`, 
 |Comprobar actualizaciones| Por defecto activado |
 |Intervalo de comprobación| Horas entre comprobaciones. Acepta decimales. Por defecto 4 |
 |Contenedores parados| Si comprueba también las actualizaciones de los contenedores detenidos. Por defecto activado |
+|Por contenedor| Qué contenedores se actualizan solos y cuáles no se comprueban. También desde el `/info` de cada uno. Por defecto ninguno: avisa de todos |
 |Canal de notificaciones| Canal donde se publicarán exclusivamente los cambios de estado de los contenedores (arranque, parada, creación y actualizaciones automáticas). La gestión se sigue haciendo desde el chat privado con el bot o desde TELEGRAM_GROUP. El bot comprueba que puede publicar ahí antes de guardarlo |
-|Hosts de Docker| Las máquinas que gestiona el bot. Se añaden, se prueban, se renombran y se quitan desde aquí. Ver desplegable de hosts remotos |
+|Hosts de Docker| Las máquinas que gestiona el bot. Se añaden, se prueban, se renombran, se les cambia la URL y se quitan desde aquí. Ver desplegable de hosts remotos |
 |Estadísticas anónimas| Una vez al día envía cifras anónimas de uso. Por defecto activado. Ver [Estadísticas anónimas](#-estadísticas-anónimas) |
 
 Los cambios hechos desde `/settings` se aplican al momento, sin reiniciar el contenedor.
@@ -329,7 +350,9 @@ El nombre es opcional; si no lo pones, el bot lo saca de la URL. Antes de guarda
 | `❌ No sé conectarme a...` | La URL no empieza por `ssh://`, `tcp://` o `unix://` |
 | `❌ ya está registrado` | Esa máquina ya está añadida; añadirla dos veces duplicaría sus contenedores |
 
-Después, pulsando el host en esa misma pantalla puedes **🔄 Probar de nuevo**, **✏️ Renombrar**, **⏸️ Pausar host** o **🗑️ Quitar host**. El 🟢, el 🔴 y el ⏸️ de la lista te dicen de un vistazo cuál responde y cuál está en pausa.
+Después, pulsando el host en esa misma pantalla puedes **🔄 Probar de nuevo**, **✏️ Renombrar**, **🔗 Cambiar URL**, **⏸️ Pausar host** o **🗑️ Quitar host**. El 🟢, el 🔴 y el ⏸️ de la lista te dicen de un vistazo cuál responde y cuál está en pausa.
+
+**🔗 Cambiar URL** es para cuando la máquina cambia de IP o quieres pasar de `tcp://` a `ssh://`. El host conserva sus ajustes por contenedor y sus programaciones, cosa que no pasa si lo quitas y lo vuelves a añadir. La URL nueva se prueba antes de guardarla, igual que al añadir un host. Si lleva al mismo Docker, se cambia sin más. Si lleva a otro Docker, o no se puede comprobar porque la URL de ahora ya no responde, el bot pregunta antes de cambiarla, porque lo guardado se aplicaría a los contenedores de esa máquina que se llamen igual. Si es otro Docker, su caché de actualizaciones se vacía, porque hablaba de otra máquina.
 
 **⏸️ Pausar** es para la máquina que no está disponible ahora mismo pero que vas a recuperar: deja de listarse, de comprobarse y de aparecer en los menús, y sus programaciones se saltan en vez de deshabilitarse. No se pierde nada —ni la URL, ni el nombre, ni las tareas— y el mismo botón la reanuda. El host local no se puede pausar, porque el bot corre en él.
 
@@ -455,12 +478,35 @@ En `settings.json` solo va la URL y, para TLS, las rutas de los certificados. Ni
 </details>
 
 <details>
-<summary>🏷️ Funciones extra con labels en otros contenedores</summary>
+<summary>🔄 Contenedores que se actualizan solos o que no se comprueban</summary>
 
-- Añadiendo la etiqueta `DCB-Ignore-Check-Updates` a un contenedor, no se comprobarán actualizaciones para él.
-- Añadiendo la etiqueta `DCB-Auto-Update` a un contenedor, se actualizará automáticamente sin preguntar.
+Por defecto, cuando hay una versión nueva el bot te avisa. Para cada contenedor puedes elegir otra cosa:
 
-Ver ejemplo completo en la FAQ: *«He visto que se pueden añadir labels…»*.
+- **🔄 Actualizar solo:** se actualiza sin preguntar en cuanto la comprobación encuentra una versión nueva. Todos los de una misma comprobación van juntos, en un único mensaje de resumen, como si los hubieras marcado tú en `/updateall`.
+- **🚫 No comprobar:** la comprobación no lo mira: ni avisos, ni `/updateall`.
+
+Se elige desde el bot, de dos formas, y en las dos cada toque pasa al siguiente (avisar → actualizar solo → no comprobar):
+
+- En el `/info` de un contenedor, con el botón **🤖 - Versión nueva**.
+- Para muchos a la vez, en `/settings` → Actualizaciones → **📦 Por contenedor**, con la lista de contenedores: 🔔 avisa · 🔄 se actualiza solo · 🚫 no se comprueba.
+
+Se guarda en `settings.json` por host y por nombre de contenedor, así que se conserva aunque el contenedor se recree o se actualice. Si lo borras con `/delete`, o borrando su proyecto, se olvida al momento. Si desaparece de cualquier otra forma (también con `/prune`), se olvida cuando lleva 30 días sin aparecer en un host que responde, y el bot te lo dice. Mientras un host no responde o está en pausa, lo suyo no se toca; al quitar un host, se va con él.
+
+También sirven las labels de siempre, `DCB-Auto-Update` y `DCB-Ignore-Check-Updates`. Si un contenedor lleva una de ellas, manda la label, aunque valga `false`: en el bot sale con 🏷️ y se cambia en su compose. Ver ejemplo completo en la FAQ: *«He visto que se pueden añadir labels…»*.
+
+</details>
+
+<details>
+<summary>🔔 De qué avisa cada contenedor</summary>
+
+Por defecto el bot avisa de todo lo que le pasa a un contenedor: cuando arranca, cuando se para, cuando falla. Para cada uno puedes elegir menos:
+
+- **⚠️ Solo problemas:** calla los arranques, las paradas que se piden (un `docker stop`, el bot, una tarea, un script de copia de seguridad) y los procesos que terminan bien, y sigue avisando de lo que falla: una caída con código distinto de 0, la falta de memoria, un healthcheck que falla y cuando vuelve a ir, y los bucles de reinicio.
+- **🔕 Ninguno:** no avisa de nada de ese contenedor.
+
+Se elige en el `/info` de un contenedor, con el botón **🤖 - Avisos**, o para muchos a la vez en `/settings` → **🔔 Avisos por contenedor**. Se guarda igual que lo de las actualizaciones, y también se puede poner en el compose con la label `DCB-Notifications=problems` o `DCB-Notifications=none`, que manda sobre lo elegido en el bot.
+
+Lo que pidas tú desde el bot (arrancar, parar, reiniciar) te lo confirma igualmente. Y no gasta nada: el bot lo decide con la label que ya viene en cada evento de Docker y con los ajustes que tiene en memoria, sin preguntar nada más a Docker.
 
 </details>
 
@@ -525,9 +571,12 @@ Tampoco se envía nada si la configuración no está en un volumen, porque sin �
 <details>
 <summary>🛠️ He visto que se pueden añadir labels para controlar ciertas cosas de los contenedores, ¿cómo lo hago?</summary>
 
-Efectivamente, actualmente hay dos etiquetas (*labels*) que puedes añadir a los contenedores para controlarlos:  
+Efectivamente, hay tres etiquetas (*labels*) que puedes añadir a los contenedores para controlarlos:  
 - `DCB-Ignore-Check-Updates`  
-- `DCB-Auto-Update`
+- `DCB-Auto-Update`  
+- `DCB-Notifications=problems` o `DCB-Notifications=none`, para que solo avise de problemas o de nada
+
+Lo mismo se puede elegir desde el propio bot, sin tocar el compose: en el `/info` de cada contenedor, en `/settings` → Actualizaciones → 📦 Por contenedor y en `/settings` → 🔔 Avisos por contenedor. Si un contenedor lleva la label, manda la label.
 
 Para añadirlas a un contenedor, basta con editar el archivo `docker-compose.yml` y agregarlas bajo la clave `labels`.  
 A continuación se muestra un ejemplo con **Home Assistant**:
@@ -547,6 +596,7 @@ services:
       - /volume2/temp/ha:/tmp
     labels:
       - "DCB-Auto-Update"
+      - "DCB-Notifications=problems" # solo avisa si falla, no de cada arranque o parada
     restart: unless-stopped
 ```
 </details>
@@ -681,7 +731,7 @@ docker --tlsverify --tlscacert=ca.pem --tlscert=cert.pem --tlskey=key.pem   -H t
 
 Las rutas son **las de dentro del contenedor**, o sea la parte derecha del volumen del paso 3. El `id` lo eliges tú y da igual cuál sea, siempre que no se repita: solo tiene que ser estable, porque es lo que atan las programaciones y la caché de actualizaciones.
 
-> ❗ **Importante:** editar `settings.json` a mano **requiere reiniciar el contenedor**: el bot lo lee al arrancar y lo mantiene en memoria. Después del reinicio el host aparece en `/settings` → **🖥️ Hosts de Docker** como cualquier otro, y ya se puede probar, renombrar y quitar desde ahí.
+> ❗ **Importante:** editar `settings.json` a mano **requiere reiniciar el contenedor**: el bot lo lee al arrancar y lo mantiene en memoria. Después del reinicio el host aparece en `/settings` → **🖥️ Hosts de Docker** como cualquier otro, y ya se puede probar, renombrar, cambiarle la URL y quitar desde ahí.
 
 </details>
 
@@ -702,7 +752,7 @@ Igual que cualquier otro contenedor: desde `/checkupdate docker-controller-bot` 
 
 Internamente el bot lanza un contenedor auxiliar (`UPDATER-Docker-Controler-Bot`) que se encarga de descargar la nueva imagen, sustituirla y volver a levantar el bot, evitando que el propio bot se quede sin proceso a mitad de la actualización.
 
-Si le añades la label `DCB-Auto-Update` a su `docker-compose.yml`, se actualizará solo en cuanto detecte una nueva versión.
+Si en su `/info` eliges **🔄 Actualizar solo** (o le añades la label `DCB-Auto-Update` en su `docker-compose.yml`), se actualizará solo en cuanto detecte una nueva versión.
 </details>
 
 ---
@@ -724,41 +774,52 @@ docker-controller-bot/
     ├── LICENSE
     ├── requirements.txt
     ├── README.md
-    ├── Dockerfile_local
-    ├── docker-compose.debug.yaml
-    ├── docker-controller-bot.py   # punto de entrada: importa y arranca
-    ├── core.py                    # el núcleo: DockerManager, monitores, teclados, UI
-    ├── commands.py                # un `cmd_*` por comando
-    ├── callbacks.py               # un `cb_*` por botón
-    ├── callback_registry.py       # el decorador `@callback` y el parseo
-    ├── host_registry.py           # los hosts Docker y su caché de clientes
-    ├── store.py                   # settings.json, estado y cachés
-    ├── migration.py               # migraciones de arranque (4.x → 5.0)
-    ├── config.py                  # variables de arranque y constantes
-    ├── i18n.py                    # carga de idiomas y `get_text`
-    ├── own_container.py           # se identifica a sí mismo sin que se lo digan
-    ├── docker_update.py
-    ├── docker_compose_manager.py
-    ├── compose_generator.py
-    ├── port_manager.py
-    ├── schedule_manager.py
-    ├── message_queue.py
-    ├── logger.py
-    ├── tests
-    │   ├── run_all.py
-    │   └── ...
-    └── locale
-        ├── en.json
-        ├── es.json
-        ├── de.json
-        ├── ru.json
-        ├── gl.json
-        ├── nl.json
-        ├── cat.json
-        └── it.json
+    ├── Dockerfile
+    ├── docker-compose.yaml
+    ├── dev
+    │   ├── Dockerfile_local
+    │   ├── Dockerfile_debug
+    │   ├── docker-compose.debug.yaml
+    │   └── bench_events.py            # lo que cuesta el monitor de eventos, contra un Docker real
+    ├── src
+    │   ├── docker-controller-bot.py   # punto de entrada: importa y arranca
+    │   ├── core.py                    # el núcleo: DockerManager, monitores, teclados, UI
+    │   ├── commands.py                # un `cmd_*` por comando
+    │   ├── callbacks.py               # un `cb_*` por botón
+    │   ├── callback_registry.py       # el decorador `@callback` y el parseo
+    │   ├── host_registry.py           # los hosts Docker y su caché de clientes
+    │   ├── store.py                   # settings.json, estado y cachés
+    │   ├── migration.py               # migraciones de arranque (4.x → 5.0)
+    │   ├── config.py                  # variables de arranque y constantes
+    │   ├── i18n.py                    # carga de idiomas y `get_text`
+    │   ├── own_container.py           # se identifica a sí mismo sin que se lo digan
+    │   ├── unraid.py                  # avisa a Unraid de lo que actualiza el bot
+    │   ├── dcb_mute.py                # `dcb-mute`: silenciar desde un script
+    │   ├── docker_update.py
+    │   ├── docker_compose_manager.py
+    │   ├── compose_generator.py
+    │   ├── container_listing.py
+    │   ├── formatting.py
+    │   ├── port_manager.py
+    │   ├── schedule_manager.py
+    │   ├── schedules.py
+    │   ├── message_queue.py
+    │   ├── logger.py
+    │   └── locale
+    │       ├── en.json
+    │       ├── es.json
+    │       ├── de.json
+    │       ├── ru.json
+    │       ├── gl.json
+    │       ├── nl.json
+    │       ├── cat.json
+    │       └── it.json
+    └── tests
+        ├── run_all.py
+        └── ...
 ```
 
-Para levantarlo habría que ejecutar en esa ruta: `docker compose -f docker-compose.debug.yaml up  -d --build --force-recreate`
+Para levantarlo habría que ejecutar en esa ruta: `docker compose -f dev/docker-compose.debug.yaml up  -d --build --force-recreate`
 Para detenerlo y eliminarlo: `docker compose down --rmi`
 
 Para probar nuevos cambios bastaría con guardar. Los cambios se refrescan en caliente.

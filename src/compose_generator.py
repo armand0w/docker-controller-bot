@@ -1,0 +1,709 @@
+"""
+Compose Generator
+Turns the configuration extracted from a running container into a
+docker-compose service definition.
+
+The container configuration is NOT read here: it comes from
+`docker_update.extract_container_config`, the same extractor used to recreate
+containers on every update. That extractor already solves the hard parts
+(dropping values inherited from the image, resolving network endpoints,
+normalising devices, detecting hostname/network_mode conflicts), so this module
+only has to translate its output into Compose Spec keys.
+"""
+import yaml
+
+from docker_compose_manager import COMPOSE_PROJECT_LABEL
+
+
+class _Quoted(str):
+	"""
+	A string that must always be emitted quoted.
+
+	YAML 1.1 reads `22:22` as a base-60 number (1342), which silently corrupts
+	port mappings. Quoting them keeps them strings for every parser.
+	"""
+
+
+class _ComposeDumper(yaml.SafeDumper):
+	"""SafeDumper that knows how to emit _Quoted, without touching global state"""
+
+
+_ComposeDumper.add_representer(
+	_Quoted,
+	lambda dumper, data: dumper.represent_scalar("tag:yaml.org,2002:str", str(data), style="'"),
+)
+
+
+# Engine defaults. A value equal to any of these was not chosen by the user, so
+# writing it into the compose file would only add noise.
+DEFAULT_SHM_SIZE = 67108864  # 64MB
+DEFAULT_LOG_DRIVER = "json-file"
+DEFAULT_IPC_MODES = ("", "private")
+DEFAULT_RUNTIMES = ("", "runc")
+DEFAULT_NETWORK_MODES = ("", "bridge", "default")
+# Network modes that are written as `network_mode:` instead of a named network
+LITERAL_NETWORK_MODES = ("host", "none")
+
+# Labels managed by Docker Compose itself: they are re-created by `compose up`
+# and pinning them by hand would be wrong.
+COMPOSE_MANAGED_LABEL_PREFIX = "com.docker.compose."
+
+# Reserved compose name for the network a project creates for itself
+DEFAULT_NETWORK_KEY = "default"
+
+# `priority` of the container's main network when it has several, for compose
+# to keep it as the primary rather than take the first by name. The rest are
+# at compose's default, 0.
+MAIN_NETWORK_PRIORITY = 1
+
+# Restart policies that mean "no restart policy at all"
+EMPTY_RESTART_POLICIES = ("", "no")
+
+
+def _format_bytes(value):
+	"""Bytes as the shortest exact compose suffix ('512m'), or the raw number"""
+	try:
+		value = int(value)
+	except (TypeError, ValueError):
+		return None
+	if value <= 0:
+		return None
+	for suffix, unit in (("g", 1024 ** 3), ("m", 1024 ** 2), ("k", 1024)):
+		if value % unit == 0:
+			return f"{value // unit}{suffix}"
+	return str(value)
+
+
+def _format_duration(nanoseconds):
+	"""Nanoseconds (Docker API) as a compose duration string ('30s', '1m30s')"""
+	try:
+		nanoseconds = int(nanoseconds)
+	except (TypeError, ValueError):
+		return None
+	if nanoseconds <= 0:
+		return None
+	if nanoseconds % 1000000000:
+		milliseconds = nanoseconds // 1000000
+		return f"{milliseconds}ms" if milliseconds else f"{nanoseconds}ns"
+	seconds = nanoseconds // 1000000000
+	minutes, seconds = divmod(seconds, 60)
+	hours, minutes = divmod(minutes, 60)
+	parts = []
+	if hours:
+		parts.append(f"{hours}h")
+	if minutes:
+		parts.append(f"{minutes}m")
+	if seconds or not parts:
+		parts.append(f"{seconds}s")
+	return "".join(parts)
+
+
+def _escape_interpolation(value):
+	"""
+	Every `$` in the values doubled, the way Compose reads a literal one.
+
+	Compose interpolates `$VAR` and `${VAR}` everywhere in the file, and what
+	the container holds is already the result: a Traefik basicauth label
+	(`admin:$apr1$...`) or `DB_PASSWORD=p$ss$word` written as it is came back
+	with the "variables" replaced by nothing, so recreating from the file broke
+	the login and initialised a new database with the password "p". A `$$VAR`
+	the user wrote for the shell inside the container (a CMD-SHELL healthcheck,
+	say) reads back as `$VAR`, and this gives it its `$$` back too.
+
+	Only the values: Compose does not interpolate keys, so a `$` in a label's
+	name is already literal and doubling it would change the name. _Quoted
+	stays _Quoted, or the ports would lose their quotes.
+	"""
+	if isinstance(value, _Quoted):
+		return _Quoted(value.replace("$", "$$"))
+	if isinstance(value, str):
+		return value.replace("$", "$$")
+	if isinstance(value, dict):
+		return {key: _escape_interpolation(item) for key, item in value.items()}
+	if isinstance(value, (list, tuple)):
+		return [_escape_interpolation(item) for item in value]
+	return value
+
+
+def _is_named_volume(source):
+	"""Whether a bind source is a named volume instead of a host path"""
+	return bool(source) and not source.startswith(("/", "./", "../", "~"))
+
+
+class ComposeGenerator:
+	"""
+	Builds a docker-compose document for a single container.
+
+	Usage:
+		ComposeGenerator(service_name, config).to_yaml()
+
+	where `config` is the dict returned by
+	`docker_update.extract_container_config`.
+	"""
+
+	def __init__(self, service_name, config):
+		self.service_name = service_name
+		self.config = config or {}
+		# Named volumes and networks referenced by the service, collected while
+		# building it so they can be declared at the top level.
+		self._named_volumes = set()
+		self._named_networks = {}
+		# Whether the default bridge was left out next to other networks.
+		self._dropped_bridge = False
+
+	# ------------------------------------------------------------------
+	# Public API
+	# ------------------------------------------------------------------
+	def build(self):
+		"""Returns the compose document as a plain dict"""
+		service = {"image": self.config.get("image", ""), "container_name": self.service_name}
+
+		self._add_runtime(service)
+		self._add_environment(service)
+		self._add_labels(service)
+		self._add_volumes(service)
+		self._add_ports(service)
+		self._add_networking(service)
+		self._add_restart_policy(service)
+		self._add_resources(service)
+		self._add_security(service)
+		self._add_devices(service)
+		self._add_namespaces(service)
+		self._add_logging(service)
+		self._add_healthcheck(service)
+		self._add_legacy(service)
+
+		# No `version:` key: it is obsolete and current Compose warns about it.
+		document = {"services": {self.service_name: service}}
+		if self._named_volumes:
+			document["volumes"] = {name: {"external": True} for name in sorted(self._named_volumes)}
+		if self._named_networks:
+			document["networks"] = dict(sorted(self._named_networks.items()))
+		return document
+
+	def to_yaml(self):
+		"""Returns the compose document rendered as YAML"""
+		return yaml.dump(
+			_escape_interpolation(self.build()),
+			Dumper=_ComposeDumper,
+			default_flow_style=False,
+			sort_keys=False,
+			allow_unicode=True,
+		)
+
+	# ------------------------------------------------------------------
+	# Helpers
+	# ------------------------------------------------------------------
+	def _set(self, service, key, value):
+		"""Adds a key only when the value carries information"""
+		if value in (None, "", [], {}, False):
+			return
+		service[key] = value
+
+	def _get(self, key, default=None):
+		value = self.config.get(key)
+		return default if value in (None, "", [], {}) else value
+
+	# ------------------------------------------------------------------
+	# Sections
+	# ------------------------------------------------------------------
+	def _add_runtime(self, service):
+		self._set(service, "entrypoint", self._get("entrypoint"))
+		self._set(service, "command", self._get("command"))
+		self._set(service, "user", self._get("user"))
+		self._set(service, "working_dir", self._get("working_dir"))
+		self._set(service, "hostname", self._get("hostname"))
+		self._set(service, "domainname", self._get("domainname"))
+		self._set(service, "stop_signal", self._get("stop_signal"))
+		stop_timeout = self._get("stop_timeout")
+		if isinstance(stop_timeout, int) and not isinstance(stop_timeout, bool) and stop_timeout >= 0:
+			service["stop_grace_period"] = _format_duration(stop_timeout * 1_000_000_000)
+		self._set(service, "stdin_open", self.config.get("stdin_open", False))
+		self._set(service, "tty", self.config.get("tty", False))
+		self._set(service, "init", self.config.get("init", False))
+		self._set(service, "read_only", self.config.get("read_only", False))
+
+	def _add_environment(self, service):
+		"""
+		Environment variables the user actually set. The extractor already
+		removed everything inherited from the image (PATH, version pins...).
+		"""
+		environment = self._get("environment", [])
+		if environment:
+			service["environment"] = list(environment)
+
+	def _add_labels(self, service):
+		labels = self._get("labels", {})
+		user_labels = {
+			key: value for key, value in labels.items()
+			if not key.startswith(COMPOSE_MANAGED_LABEL_PREFIX)
+		}
+		self._set(service, "labels", user_labels)
+
+	def _add_volumes(self, service):
+		"""
+		Merges the two places Docker keeps volumes: `Binds` (docker run -v) and
+		`Mounts` (compose and `--mount`). Deduplicated by target so a container
+		listing the same volume in both does not get it twice.
+		"""
+		volumes = []
+		seen_targets = set()
+
+		for bind in self._get("volumes", []):
+			parts = str(bind).split(":")
+			if len(parts) < 2:
+				continue
+			source, target = parts[0], parts[1]
+			if target in seen_targets:
+				continue
+			seen_targets.add(target)
+			if _is_named_volume(source):
+				self._named_volumes.add(source)
+			volumes.append(str(bind))
+
+		mount_tmpfs = []
+		for mount in self._get("mounts_list", []):
+			target = mount.get("Target")
+			source = mount.get("Source")
+			if not target or target in seen_targets:
+				continue
+			if mount.get("Type") == "tmpfs":
+				# `--mount type=tmpfs`: written as compose's short tmpfs syntax,
+				# with the size and mode it was given.
+				seen_targets.add(target)
+				options = mount.get("TmpfsOptions") or {}
+				flags = []
+				if options.get("SizeBytes"):
+					flags.append(f"size={options['SizeBytes']}")
+				if options.get("Mode") is not None:
+					flags.append(f"mode={options['Mode']:o}")
+				mount_tmpfs.append(f"{target}:{','.join(flags)}" if flags else target)
+				continue
+			seen_targets.add(target)
+			if _is_named_volume(source):
+				self._named_volumes.add(source)
+			entry = f"{source}:{target}" if source else target
+			if mount.get("ReadOnly"):
+				entry = f"{entry}:ro"
+			volumes.append(entry)
+
+		# `-v /data` with nothing before it: an anonymous volume the user
+		# asked for. The image's own VOLUMEs are left out, as its other
+		# defaults are.
+		for target in self._get("anonymous_targets", []):
+			if target not in seen_targets:
+				seen_targets.add(target)
+				volumes.append(target)
+
+		self._set(service, "volumes", volumes)
+
+		tmpfs = []
+		for target, options in self._get("tmpfs_mounts", {}).items():
+			tmpfs.append(f"{target}:{options}" if options else target)
+		tmpfs.extend(mount_tmpfs)
+		self._set(service, "tmpfs", tmpfs)
+
+	def _add_ports(self, service):
+		"""
+		Port bindings from the API format to compose short syntax.
+		{'80/tcp': [{'HostIp': '', 'HostPort': '8080'}]}  ->  ['8080:80']
+		"""
+		ports = []
+		for port_spec, bindings in self._get("ports", {}).items():
+			container_port, _, protocol = str(port_spec).partition("/")
+			for binding in bindings or []:
+				host_port = binding.get("HostPort") or ""
+				host_ip = binding.get("HostIp") or ""
+				entry = f"{host_port}:{container_port}" if host_port else container_port
+				# A wildcard host IP is the default, spelling it out adds nothing
+				if host_ip and host_ip not in ("0.0.0.0", "::"):
+					entry = f"{host_ip}:{entry}"
+				if protocol and protocol != "tcp":
+					entry = f"{entry}/{protocol}"
+				if entry not in ports:
+					ports.append(_Quoted(entry))
+		self._set(service, "ports", ports)
+		# Exposed and not published. `-P` has no compose equivalent, so a port
+		# that relied on it is at least still listed here.
+		expose = []
+		for port_spec in self._get("exposed_ports", []):
+			container_port, _, protocol = str(port_spec).partition("/")
+			expose.append(_Quoted(container_port if protocol in ("", "tcp") else f"{container_port}/{protocol}"))
+		self._set(service, "expose", expose)
+
+	def _add_networking(self, service):
+		"""
+		`host`, `none` and `container:<id>` become `network_mode`. Anything else
+		becomes named networks declared as external, each carrying its endpoint
+		settings (static IP, aliases...) when it has any.
+		"""
+		network_mode = self._get("network_mode", "")
+		mode = str(network_mode).lower()
+
+		if mode in LITERAL_NETWORK_MODES or mode.startswith("container:"):
+			service["network_mode"] = network_mode
+		else:
+			self._add_named_networks(service, mode)
+
+		self._keep_main_network_first(service, network_mode)
+		self._set_mac_address(service, network_mode)
+		self._set(service, "dns", self._get("dns"))
+		self._set(service, "dns_opt", self._get("dns_opt"))
+		self._set(service, "dns_search", self._get("dns_search"))
+		self._set(service, "extra_hosts", self._get("extra_hosts"))
+
+	def _keep_main_network_first(self, service, network_mode):
+		"""
+		Compose makes the primary network the one with the highest
+		`priority`, then the first by name, which on a container with several
+		need not be this one's: it came back with another main network, and
+		the MAC set by hand on another interface. With more than one, the
+		main network gets the priority.
+		"""
+		networks = service.get("networks")
+		if not networks or len(networks) < 2:
+			return
+		if not isinstance(networks, dict):
+			networks = service["networks"] = {name: {} for name in networks}
+		key = network_mode if network_mode in networks else None
+		if key is None and network_mode == self._project_default_network() and DEFAULT_NETWORK_KEY in networks:
+			key = DEFAULT_NETWORK_KEY
+		if key is not None:
+			networks[key] = dict(networks[key] or {}, priority=MAIN_NETWORK_PRIORITY)
+
+	def _set_mac_address(self, service, network_mode):
+		"""
+		The MAC set by hand, at service level: compose gives it to the primary
+		network, kept as the main one by _keep_main_network_first.
+
+		Not under its own network: Docker only says a MAC was set by hand
+		(Config.MacAddress) for the primary, so with compose taking another
+		one the next /compose had lost it. And Compose before 2.20.2 refuses
+		it there.
+		"""
+		mac = self._get("mac_address") or self._get("mac_address_by_hand")
+		if not mac or service.get("network_mode"):
+			return
+		if self._dropped_bridge and str(network_mode).lower() in ("bridge", "default"):
+			# On the default bridge, which compose cannot put next to other
+			# networks (see _add_named_networks): it has nowhere to go.
+			return
+		# Compose 2.29 only gives it to a network written as a mapping:
+		# `networks: [lan]`, `lan:` with nothing, or no networks at all, and
+		# the container came back with another MAC.
+		networks = service.get("networks")
+		if not networks:
+			service["networks"] = {DEFAULT_NETWORK_KEY: {}}
+		elif not isinstance(networks, dict):
+			service["networks"] = {name: {} for name in networks}
+		else:
+			for name, entry in networks.items():
+				if entry is None:
+					networks[name] = {}
+		service["mac_address"] = mac
+
+	def _add_named_networks(self, service, mode):
+		"""
+		Declares every network the container is attached to, not just the
+		primary one: a container on two networks would otherwise come back with
+		a compose file that puts it on one.
+		"""
+		project_default = self._project_default_network()
+		raw_networks = self._get("networks", {})
+
+		networks = {}
+		for name, endpoint in raw_networks.items():
+			if str(name).lower() in LITERAL_NETWORK_MODES:
+				continue
+			endpoint = self._clean_endpoint(endpoint)
+			# The `<project>_default` network is created by compose itself on
+			# every `up`, so declaring it as external would be a lie. Its
+			# endpoint settings still matter though: written under the reserved
+			# `default` key they survive without pinning the network's name.
+			# A static IP is the exception, it needs the network declared with
+			# its subnet, so that one keeps the real name.
+			# Listed even with nothing to say when it is not the only one: a
+			# service that declares networks joins those and no other, and
+			# the container came back off its own stack's network.
+			if name == project_default and not (endpoint.get("ipv4_address") or endpoint.get("ipv6_address")):
+				if endpoint or len(raw_networks) > 1:
+					service.setdefault("networks", {})[DEFAULT_NETWORK_KEY] = endpoint
+				continue
+			networks[name] = endpoint
+
+		# Fall back to the primary network only when the endpoint list is
+		# missing altogether (older API versions). An empty list because
+		# everything was filtered out means there is nothing to declare.
+		if not raw_networks and mode not in DEFAULT_NETWORK_MODES and mode != project_default:
+			endpoint = {}
+			self._set(endpoint, "ipv4_address", self._get("ipv4_address"))
+			self._set(endpoint, "ipv6_address", self._get("ipv6_address"))
+			self._set(endpoint, "aliases", self._get("network_aliases"))
+			self._set(endpoint, "link_local_ips", self._get("link_local_ips"))
+			networks = {self._get("network_mode"): self._clean_endpoint(endpoint)}
+
+		# Compose cannot put a service on the default bridge next to other
+		# networks: declared as one more, every `up` failed ("network-scoped
+		# alias is supported only for containers in user defined networks").
+		# Left out, the file at least comes up, on the others.
+		if "bridge" in networks and len(networks) + (DEFAULT_NETWORK_KEY in (service.get("networks") or {})) > 1:
+			del networks["bridge"]
+			self._dropped_bridge = True
+
+		# A container sitting only on the default bridge needs no declaration
+		if not networks or (len(networks) == 1 and not any(networks.values())
+							and list(networks)[0].lower() in DEFAULT_NETWORK_MODES):
+			if not service.get("networks"):
+				service.pop("networks", None)
+			return
+
+		declared = service.get("networks") or {}
+		if any(networks.values()) or declared:
+			merged = dict(declared)
+			merged.update({name: networks[name] for name in sorted(networks)})
+			service["networks"] = merged
+		else:
+			service["networks"] = sorted(networks)
+		for name in networks:
+			self._named_networks[name] = {"external": True}
+
+	def _project_default_network(self):
+		"""Name of the default network compose creates for this container's project"""
+		project = (self.config.get("labels") or {}).get(COMPOSE_PROJECT_LABEL)
+		return f"{project}_default" if project else None
+
+	def _clean_endpoint(self, endpoint):
+		"""
+		Drops duplicated aliases and the container's own name, which Docker adds
+		back on its own.
+
+		The compose service name is deliberately kept: in the generated file the
+		service is named after the container, so dropping it would take away the
+		DNS name the rest of the stack uses to reach this one.
+		"""
+		endpoint = dict(endpoint or {})
+		# Compose has no per-network links: the service's `external_links`
+		# carries them, and Docker puts them back on every network.
+		endpoint.pop("links", None)
+		# Docker reports the MAC it is using, set by hand or not: writing it
+		# would pin every assigned one.
+		endpoint.pop("mac_address", None)
+		aliases = endpoint.get("aliases")
+		if not aliases:
+			return endpoint
+		implicit = {self.service_name}
+		deduped = []
+		for alias in aliases:
+			if alias in implicit or alias in deduped:
+				continue
+			deduped.append(alias)
+		if deduped:
+			endpoint["aliases"] = deduped
+		else:
+			endpoint.pop("aliases")
+		return endpoint
+
+	def _add_restart_policy(self, service):
+		policy = self._get("restart_policy", {})
+		name = policy.get("Name") or ""
+		if name in EMPTY_RESTART_POLICIES:
+			return
+		if name == "on-failure" and policy.get("MaximumRetryCount"):
+			service["restart"] = f"on-failure:{policy['MaximumRetryCount']}"
+		else:
+			service["restart"] = name
+
+	def _add_resources(self, service):
+		self._set(service, "mem_limit", _format_bytes(self.config.get("mem_limit")))
+		self._set(service, "mem_reservation", _format_bytes(self.config.get("mem_reservation")))
+		self._set(service, "shm_size", self._shm_size())
+
+		cpus = self._cpus()
+		if cpus is not None:
+			service["cpus"] = cpus
+
+		self._set(service, "cpu_shares", self.config.get("cpu_shares") or None)
+		self._set(service, "cpuset", self._get("cpuset_cpus"))
+		self._set(service, "mem_swappiness", self._mem_swappiness())
+		self._set(service, "oom_kill_disable", self.config.get("oom_kill_disable", False))
+		self._set(service, "oom_score_adj", self.config.get("oom_score_adj") or None)
+		pids_limit = self.config.get("pids_limit") or 0
+		if pids_limit > 0:
+			service["pids_limit"] = pids_limit
+
+	def _cpus(self):
+		"""
+		Number of CPUs as compose expresses it. `--cpus` and compose's own
+		`cpus:` are stored as NanoCpus; containers configured the old way carry
+		a quota over a period instead.
+		"""
+		nano_cpus = self.config.get("nano_cpus") or 0
+		if nano_cpus > 0:
+			cpus = nano_cpus / 1000000000
+		else:
+			quota = self.config.get("cpu_quota") or 0
+			period = self.config.get("cpu_period") or 0
+			if quota <= 0 or period <= 0:
+				return None
+			cpus = quota / period
+		return int(cpus) if cpus == int(cpus) else round(cpus, 3)
+
+	def _shm_size(self):
+		size = self.config.get("shm_size")
+		if not size or size == DEFAULT_SHM_SIZE:
+			return None
+		return _format_bytes(size)
+
+	def _mem_swappiness(self):
+		# -1 means "not set"
+		value = self.config.get("mem_swappiness")
+		if value is None or value < 0:
+			return None
+		return value
+
+	def _add_security(self, service):
+		self._set(service, "privileged", self.config.get("privileged", False))
+		self._set(service, "cap_add", self._get("cap_add"))
+		self._set(service, "cap_drop", self._get("cap_drop"))
+		self._set(service, "security_opt", self._get("security_opt"))
+		self._set(service, "group_add", self._get("group_add"))
+		self._set(service, "sysctls", self._get("sysctls"))
+		self._set(service, "storage_opt", self._get("storage_opt"))
+
+		# API: [{'Name': 'nofile', 'Soft': 1024, 'Hard': 2048}]
+		# compose: {nofile: {soft: 1024, hard: 2048}}
+		ulimits = {}
+		for ulimit in self._get("ulimits", []):
+			name = ulimit.get("Name")
+			if not name:
+				continue
+			soft, hard = ulimit.get("Soft"), ulimit.get("Hard")
+			if soft == hard and soft is not None:
+				ulimits[name] = soft
+			else:
+				entry = {}
+				if soft is not None:
+					entry["soft"] = soft
+				if hard is not None:
+					entry["hard"] = hard
+				ulimits[name] = entry
+		self._set(service, "ulimits", ulimits)
+
+	def _add_devices(self, service):
+		self._set(service, "devices", self._get("devices"))
+		self._set(service, "device_cgroup_rules", self._get("device_cgroup_rules"))
+		self._set(service, "blkio_config", self._blkio_config())
+		extra = self._get("host_config_extra", {})
+		self._set(service, "annotations", dict(extra.get("Annotations") or {}))
+		# GPUs: `--gpus` and compose's device reservations are the same
+		# DeviceRequests underneath, and compose spells them this way.
+		devices = []
+		for request in extra.get("DeviceRequests") or []:
+			device = {}
+			self._set(device, "driver", request.get("Driver"))
+			count = request.get("Count")
+			if count == -1:
+				device["count"] = "all"
+			elif count:
+				device["count"] = count
+			self._set(device, "device_ids", request.get("DeviceIDs"))
+			capabilities = [cap for group in (request.get("Capabilities") or []) for cap in group]
+			self._set(device, "capabilities", capabilities)
+			self._set(device, "options", request.get("Options"))
+			if device:
+				devices.append(device)
+		if devices:
+			service["deploy"] = {"resources": {"reservations": {"devices": devices}}}
+
+	def _blkio_config(self):
+		"""Groups the blkio weights and per-device limits under blkio_config"""
+		blkio = {}
+		weight = self.config.get("blkio_weight") or 0
+		if weight:
+			blkio["weight"] = weight
+		mapping = (
+			("weight_device", "blkio_weight_device"),
+			("device_read_bps", "device_read_bps"),
+			("device_read_iops", "device_read_iops"),
+			("device_write_bps", "device_write_bps"),
+			("device_write_iops", "device_write_iops"),
+		)
+		for compose_key, config_key in mapping:
+			entries = []
+			for entry in self._get(config_key, []):
+				converted = {}
+				if entry.get("Path"):
+					converted["path"] = entry["Path"]
+				if entry.get("Rate") is not None:
+					converted["rate"] = entry["Rate"]
+				if entry.get("Weight") is not None:
+					converted["weight"] = entry["Weight"]
+				if converted:
+					entries.append(converted)
+			if entries:
+				blkio[compose_key] = entries
+		return blkio
+
+	def _add_namespaces(self, service):
+		ipc_mode = self._get("ipc_mode", "")
+		if str(ipc_mode).lower() not in DEFAULT_IPC_MODES:
+			service["ipc"] = ipc_mode
+		self._set(service, "pid", self._get("pid_mode"))
+		self._set(service, "uts", self._get("uts_mode"))
+		self._set(service, "userns_mode", self._get("userns_mode"))
+		self._set(service, "cgroup_parent", self._get("cgroup_parent"))
+		# Only `host` is worth writing: `private` is the daemon default
+		if str(self._get("cgroupns", "")).lower() == "host":
+			service["cgroup"] = "host"
+		runtime = self._get("runtime", "")
+		if str(runtime).lower() not in DEFAULT_RUNTIMES:
+			service["runtime"] = runtime
+
+	def _add_logging(self, service):
+		"""Only when the driver or its options differ from the daemon default"""
+		log_config = self._get("log_config", {})
+		driver = log_config.get("Type") or ""
+		options = log_config.get("Config") or {}
+		if not driver or (driver == DEFAULT_LOG_DRIVER and not options):
+			return
+		logging = {"driver": driver}
+		if options:
+			logging["options"] = options
+		service["logging"] = logging
+
+	def _add_healthcheck(self, service):
+		"""API durations are nanoseconds, compose wants '30s'-style strings"""
+		healthcheck = self._get("healthcheck", {})
+		if not healthcheck:
+			return
+		test = healthcheck.get("Test") or []
+		if test == ["NONE"]:
+			service["healthcheck"] = {"disable": True}
+			return
+		result = {}
+		if test:
+			result["test"] = list(test)
+		for compose_key, api_key in (
+			("interval", "Interval"),
+			("timeout", "Timeout"),
+			("start_period", "StartPeriod"),
+			("start_interval", "StartInterval"),
+		):
+			duration = _format_duration(healthcheck.get(api_key))
+			if duration:
+				result[compose_key] = duration
+		if healthcheck.get("Retries"):
+			result["retries"] = healthcheck["Retries"]
+		self._set(service, "healthcheck", result)
+
+	def _add_legacy(self, service):
+		"""Legacy options that would otherwise be silently dropped"""
+		# The generated file holds one service, so whatever it links to lives
+		# outside it: that is `external_links`, by container name.
+		self._set(service, "external_links", [
+			name if name == alias else f"{name}:{alias}" for name, alias in self._get("links", [])])
+		# Another container, not a service of this file: compose's
+		# `container:` form.
+		self._set(service, "volumes_from", [
+			entry if str(entry).startswith(("container:", "service:")) else f"container:{entry}"
+			for entry in self._get("volumes_from", [])])

@@ -3,7 +3,7 @@ services:
         build:
           context: .
           dockerfile_inline: |
-            FROM alpine:3.24.2
+            FROM alpine:3.24.3
 
             ENV TZ=America/Mexico_City \
                 PYTHONUNBUFFERED=1
@@ -20,11 +20,12 @@ services:
             RUN export PIP_BREAK_SYSTEM_PACKAGES=1 && \
                 pip3 install --no-cache-dir -Ur /app/requirements.txt
 
-            COPY *.py /app/
-            COPY locale /app/locale
+            COPY src/ /app/
+
+            RUN chmod +x /app/dcb_mute.py && ln -s /app/dcb_mute.py /usr/local/bin/dcb-mute
 
             HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-                CMD python3 -c "import sys; sys.exit(0)" || exit 1
+                CMD python3 -c "import os, sys, time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/dcb-heartbeat') < 120 else 1)" || exit 1
 
             ENTRYPOINT ["python3", "docker-controller-bot.py"]
         pull_policy: build

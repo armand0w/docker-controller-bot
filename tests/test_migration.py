@@ -146,36 +146,24 @@ def test_the_4_x_pickle_cache_is_discarded():
 	shutil.rmtree(root, ignore_errors=True)
 
 
-def test_an_active_mute_is_carried_over():
+def test_the_4x_mute_file_is_left_for_the_bot():
 	"""
-	Someone who silences the bot for six hours and updates it meanwhile would
-	otherwise get every notification back at once, with nothing to explain why.
+	The bot applies .muted_until itself, at startup and while it runs, so one
+	written with the bot stopped follows the same rules as any other: the
+	migration does not consume it first with rules of its own.
 	"""
-	expires = time.time() + 3600
+	expires = str(time.time() + 3600)
 	store_, root = harness.temp_storage(legacy=True, seed_files={
 		"schedules.json": '{"schedules": []}',
-		".muted_until": str(expires),
+		".muted_until": expires,
 	})
 	migration.run()
 
 	assert store_.root() == store_.LEGACY_ROOT
-	assert abs(float(store_.state_get("mute_until")) - expires) < 1
-	assert not os.path.exists(os.path.join(store_.LEGACY_ROOT, ".muted_until"))
-
-	migration.run()  # idempotente
-	assert abs(float(store_.state_get("mute_until")) - expires) < 1
+	with open(os.path.join(store_.LEGACY_ROOT, ".muted_until"), encoding="utf-8") as handle:
+		assert handle.read() == expires
+	assert not store_.state_get("mute_until")
 	shutil.rmtree(root, ignore_errors=True)
-
-
-def test_an_expired_or_absent_mute_is_dropped():
-	for value in (str(time.time() - 3600), "0", "not-a-number"):
-		store_, root = harness.temp_storage(legacy=True, seed_files={
-			"schedules.json": '{"schedules": []}',
-			".muted_until": value,
-		})
-		migration.run()
-		assert store_.state_get("mute_until") == 0, f"con .muted_until={value!r}"
-		shutil.rmtree(root, ignore_errors=True)
 
 def test_a_mute_task_is_not_pinned_to_a_host():
 	"""
@@ -244,4 +232,57 @@ def test_nothing_is_reported_without_variables():
 	store_, root = harness.temp_storage()
 	result = migration.run()
 	assert result.imported == [] and result.ignored == []
+	shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_schedules_file_that_is_not_a_document_does_not_stop_the_start():
+	"""
+	The migration runs while core is being imported. A schedules.json holding
+	`[]` or `null` is valid JSON, and reading it as a document raised there:
+	the bot never started, and ScheduleManager never got to set the file aside
+	as it does with any other it cannot read.
+	"""
+	from schedule_manager import ScheduleManager
+
+	for content in ("[]", "null", '"schedules"', "42"):
+		store_, root = harness.temp_storage(legacy=True, seed_files={"schedules.json": content})
+		migration.run()
+
+		with open(store_.schedules_path(), encoding="utf-8") as handle:
+			assert handle.read() == content, f"la migración ha tocado {content!r}"
+
+		manager = ScheduleManager(store_.root(), store_.SCHEDULES_FILE)
+		assert manager.set_aside, f"{content!r} no se ha apartado"
+		assert manager.all() == []
+		shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_task_whose_action_is_not_text_does_not_stop_the_start():
+	"""
+	Hand-edited, an action can be a list or an object, and either one looked up
+	in the set of host actions raised the same way. Such a task belongs to no
+	host; the rest are migrated as always.
+	"""
+	store_, root = harness.temp_storage(legacy=True, seed_files={
+		"schedules.json": json.dumps({"schedules": [
+			{"name": "lista", "action": ["restart"], "host": "h_stale"},
+			{"name": "objeto", "action": {"run": True}},
+			{"name": "nada", "action": None},
+			"no es una tarea",
+			{"name": "reinicio", "action": "restart", "container": "plex"},
+			{"name": "mayúsculas", "action": "Restart", "container": "plex"},
+		]}),
+	})
+	result = migration.run()
+
+	with open(store_.schedules_path(), encoding="utf-8") as handle:
+		schedules = json.load(handle)["schedules"]
+	by_name = {s["name"]: s for s in schedules if isinstance(s, dict)}
+
+	assert by_name["lista"]["host"] is None, by_name["lista"]
+	assert not by_name["objeto"].get("host"), by_name["objeto"]
+	assert not by_name["nada"].get("host"), by_name["nada"]
+	assert by_name["reinicio"]["host"] == result.host_id, by_name["reinicio"]
+	assert by_name["mayúsculas"]["host"] == result.host_id, "sin host no podría ejecutarse"
+	assert "no es una tarea" in schedules, "lo que no es una tarea se deja como está"
 	shutil.rmtree(root, ignore_errors=True)
